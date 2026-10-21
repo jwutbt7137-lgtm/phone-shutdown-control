@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔐 安全漏洞（不要开公开 Issue）
+    url: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/security/advisories/new
+    about: 绕过 PIN、未认证关机、越权取消等问题请走私密报告
+  - name: 📖 使用与排错文档
+    url: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/tree/main/docs
+    about: 先看故障排查，多半已经有答案

@@ -1,0 +1,75 @@
+name: Bug 报告
+description: 装不上、扫不到、连不上、命令没反应
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先看一眼 [故障排查](https://github.com/jwutbt7137-lgtm/phone-shutdown-control/blob/main/docs/故障排查.md)，
+        能省一半时间。
+
+        **不要贴完整 PIN、蓝牙 MAC 地址、真实姓名或本机绝对路径。**
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象
+      description: 期望发生什么，实际发生什么
+      placeholder: 点「扫描电脑」后列表一直是空的，日志停在「权限已授予，可以扫描了」
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 电脑端 python pc_server.py --dry-run
+        2. 手机打开 App，允许附近设备权限
+        3. 点「扫描电脑」
+        4. ……
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      placeholder: Windows 11 23H2 build 22631
+    validations:
+      required: true
+
+  - type: input
+    id: phone
+    attributes:
+      label: 手机型号 + Android 版本
+      placeholder: 小米 14 / Android 14
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python 版本
+      description: 输出 `python --version`
+      placeholder: Python 3.12.4
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: 电脑端窗口输出，或 `pc-server/pc_server.log` 里的相关片段（记得打码 PIN）
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 我确认贴出的日志里没有 PIN、蓝牙 MAC 等敏感信息
+          required: true
+        - label: 我已经读过故障排查文档
+          required: false

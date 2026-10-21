@@ -1,0 +1,52 @@
+name: 功能建议
+description: 想要新按钮、新平台、新协议能力
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        这个项目刻意保持"纯本地蓝牙、无账号、无云"。提需求前请先确认不违背这个大前提。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到什么问题
+      description: 描述场景，不要直接跳到方案
+      placeholder: 家里有两台电脑，现在手机只能记住一台，换着关机要重新输入 PIN
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你希望怎么解决
+      placeholder: 希望 App 能保存多台已认证电脑，列表里直接切换
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 影响范围
+      options:
+        - 只改手机端
+        - 只改电脑端
+        - 两端都要改（协议变更）
+        - 文档 / 工程 / CI
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你考虑过的替代方案
+      placeholder: 用远程桌面 / 用智能插座，但都不满足……
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 我愿意自己提 PR 实现这个功能
+          required: false
