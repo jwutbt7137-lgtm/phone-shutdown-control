@@ -49,7 +49,8 @@ python pc_server.py
 
 ### 第 2 步：手机装 App
 
-把 `dist\电脑关机-debug.apk` 传到手机安装。
+把 `dist\电脑关机-debug.apk` 传到手机安装（现成安装包见
+[Releases](https://github.com/jwutbt7137-lgtm/phone-shutdown-control/releases)）。
 或者开 USB 调试后：
 
 ```powershell
@@ -103,3 +104,17 @@ adb install -r "dist\电脑关机-debug.apk"
 
 详细步骤见 [`docs/使用说明.md`](docs/使用说明.md)，
 出问题先看 [`docs/故障排查.md`](docs/故障排查.md)。
+
+---
+
+## 自己编译 APK
+
+需要 JDK 21、Android SDK 35、Gradle 8.x。脚本默认读环境变量 `PHONE_SHUTDOWN_TOOLS`
+指向的工具链目录（里面含 `jdk\`、`sdk\`、`gradle\bin\gradle.bat`）：
+
+```powershell
+$env:PHONE_SHUTDOWN_TOOLS = 'D:\android-toolchain'
+powershell -ExecutionPolicy Bypass -File .\build-apk.ps1
+```
+
+产物在 `android\app\build\outputs\apk\debug\`。
