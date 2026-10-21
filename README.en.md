@@ -41,7 +41,7 @@ The PC advertises a GATT service via WinRT `GattServiceProvider`; the phone conn
 ```
 ┌──────────────────┐          BLE (GATT)           ┌────────────────────┐
 │  Android phone    │  ──────────────────────────▶  │  Windows PC        │
-│  "Phone Shutdown" │   AUTH <pin>                  │  pc_server.py      │
+│  "Phone Shutdown" │   AUTH2 <hmac>                │  pc_server.py      │
 │                   │   SHUTDOWN / RESTART / ...    │  → shutdown /s     │
 └──────────────────┘                               └────────────────────┘
 ```

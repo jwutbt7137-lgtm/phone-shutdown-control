@@ -44,7 +44,7 @@
 ```
 ┌──────────────────┐          BLE (GATT)           ┌────────────────────┐
 │   Android 手机    │  ──────────────────────────▶  │    Windows 电脑     │
-│   「电脑关机」App │   AUTH <pin>                  │  pc_server.py      │
+│   「电脑关机」App │   AUTH2 <hmac>                │  pc_server.py      │
 │                  │   SHUTDOWN / RESTART / ...    │  → shutdown /s     │
 └──────────────────┘                               └────────────────────┘
 ```
