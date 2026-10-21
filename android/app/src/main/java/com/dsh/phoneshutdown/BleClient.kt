@@ -242,7 +242,7 @@ class BleClient(private val context: Context, private val listener: Listener) {
 
     /** 在字节流里找标识，允许出现在任意合理位置（容错不同厂商的封装） */
     private fun containsMarker(bytes: ByteArray): Boolean {
-        val marker = BleProtocol.ADVERT_MARKER
+        val marker = BleProtocol.ADVERT_MARKER_PREFIX
         if (bytes.size < marker.size) return false
         val limit = bytes.size - marker.size
         for (start in 0..limit) {

@@ -24,14 +24,13 @@ object BleProtocol {
     const val ADVERTISED_NAME: String = "PC-Shutdown"
 
     /**
-     * 广播数据段里的自定义标识（与电脑端 ADVERT_MARKER 一致）。
+     * 广播数据段里的自定义标识前缀（与电脑端 ADVERT_MARKER 的前 4 字节一致）。
      *
-     * 背景：Windows 的 BluetoothLEAdvertisementPublisher 在本机实测中
-     * 无法设置 local_name / service_uuids（都抛"参数错误"），只有自定义
-     * 数据段能被接受，所以用这段 ASCII 标识来精确认出电脑。
+     * 电脑端实际发的是 `PSD1` + 协议版本字节（当前 0x02）。手机只匹配前 4 字节，
+     * 这样协议版本升级后旧/新电脑都能被认出来，不会因为一个版本字节就失联。
      */
-    val ADVERT_MARKER: ByteArray = byteArrayOf(
-        'P'.code.toByte(), 'S'.code.toByte(), 'D'.code.toByte(), '1'.code.toByte(), 0x01
+    val ADVERT_MARKER_PREFIX: ByteArray = byteArrayOf(
+        'P'.code.toByte(), 'S'.code.toByte(), 'D'.code.toByte(), '1'.code.toByte()
     )
 
     /** 电脑端版本，协议不匹配时手机可以提示升级 */
