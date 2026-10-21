@@ -1,0 +1,36 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 本机运行时产物（含 PIN / 命令审计日志，绝不入库）----
+pc-server/config.json
+pc-server/pc_server.log
+pc-server/*.log
+
+# ---- Android / Gradle ----
+android/local.properties
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/captures/
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# ---- 构建中间产物 ----
+_build-tmp/
+dist/
+build/
+.gradle/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db

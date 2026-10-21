@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="white">#FFFFFFFF</color>
+    <color name="brand_primary">#FF1B6E4C</color>
+    <color name="brand_container">#FFD7F2E3</color>
+    <color name="brand_on_container">#FF06301F</color>
+    <color name="page_bg">#FFF4F6F5</color>
+    <color name="grid_line">#FFCFD8D3</color>
+    <color name="text_main">#FF1A1C1B</color>
+    <color name="text_sub">#FF5A6360</color>
+    <color name="ok_green">#FF1B6E4C</color>
+    <color name="warn_amber">#FFA66A00</color>
+    <color name="danger_red">#FFB3261E</color>
+    <color name="btn_bg">#FFFFFFFF</color>
+</resources>

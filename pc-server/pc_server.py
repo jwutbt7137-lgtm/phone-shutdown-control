@@ -1,0 +1,958 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+PC-Shutdown —— 电脑端蓝牙关机服务（Windows 10 1809+ / Windows 11）
+
+作用：在电脑上开一个蓝牙低功耗(BLE) GATT 服务并持续广播。
+      手机 App 连上来、输入本窗口显示的 PIN 之后，就能发送关机 / 重启 / 睡眠等命令。
+
+安全设计：
+  1. PIN 校验：每次启动随机生成 6 位 PIN（也可在 config.json 里固定），
+     手机必须先用 AUTH <pin> 通过校验，否则任何控制命令都会被拒绝。
+  2. 关机类命令默认带 10 秒倒计时；发送 CANCEL 可在倒计时结束前取消。
+  3. 同一时刻只允许一个手机处于"已认证"状态，新认证会把旧的踢下线。
+
+用法：
+    python pc_server.py                 # 正常运行
+    python pc_server.py --dry-run       # 演练模式：只打印将要执行的命令，既不关机也不取消
+    python pc_server.py --self-test     # 静态自检：检查依赖与 API 是否可用后退出
+    python pc_server.py --list-api      # 打印本机 WinRT BLE API 可用性
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import random
+import socket
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# 常量与协议
+# ---------------------------------------------------------------------------
+
+SERVICE_UUID = "0000a001-1e4b-4f6a-9c3d-2b7e5a8f0c11"
+RX_UUID = "0000a002-1e4b-4f6a-9c3d-2b7e5a8f0c11"   # 手机 -> 电脑（写入）
+TX_UUID = "0000a003-1e4b-4f6a-9c3d-2b7e5a8f0c11"   # 电脑 -> 手机（通知）
+
+ADVERTISED_NAME = "PC-Shutdown"
+PROTOCOL_VERSION = 1
+
+# 广播数据段里的自定义标识（AD type 0xFF）。
+# 手机端解析到这段字节就说明"这台就是关机服务"。
+# 布局：b"PSD1" + 协议版本
+ADVERT_MARKER = b"PSD1" + bytes([PROTOCOL_VERSION])
+
+MAX_AUTH_FAILURES = 5
+RX_BUFFER_LIMIT = 512
+
+HERE = Path(__file__).resolve().parent
+CONFIG_PATH = HERE / "config.json"
+LOG_PATH = HERE / "pc_server.log"
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "pin": None,                 # null = 每次启动随机生成；也可写死 "123456"
+    "shutdown_delay_seconds": 10,
+    "allow_restart": True,
+    "allow_sleep": True,
+    "allow_cancel": True,
+    "advertised_name": ADVERTISED_NAME,
+    "log_level": "INFO",
+}
+
+log = logging.getLogger("pc-shutdown")
+
+
+# ---------------------------------------------------------------------------
+# 配置
+# ---------------------------------------------------------------------------
+
+def load_config() -> Dict[str, Any]:
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_PATH.exists():
+        try:
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                cfg.update({k: v for k, v in raw.items() if k in DEFAULT_CONFIG})
+            else:
+                log.warning("config.json 顶层不是对象，已忽略，使用默认配置")
+        except Exception as exc:                      # noqa: BLE001
+            log.warning("config.json 解析失败(%s)，使用默认配置", exc)
+    return cfg
+
+
+def resolve_pin(cfg: Dict[str, Any]) -> str:
+    configured = cfg.get("pin")
+    if configured is None or str(configured).strip() == "":
+        return f"{random.randint(0, 999999):06d}"
+    text = str(configured).strip()
+    if not text.isdigit() or not (4 <= len(text) <= 12):
+        log.warning("config.json 里的 pin 必须是 4-12 位数字，已改为随机 PIN")
+        return f"{random.randint(0, 999999):06d}"
+    return text
+
+
+# ---------------------------------------------------------------------------
+# 电源动作
+# ---------------------------------------------------------------------------
+
+class PowerActions:
+    """把命令翻译成 Windows 命令并执行。dry_run=True 时只打印。"""
+
+    def __init__(self, cfg: Dict[str, Any], dry_run: bool = False) -> None:
+        self.cfg = cfg
+        self.dry_run = dry_run
+        self.pending_cancel: Optional[Callable[[], None]] = None
+        self._pending_lock = threading.Lock()
+
+    # -- 内部工具 ---------------------------------------------------------
+
+    @staticmethod
+    def _creation_flags() -> int:
+        return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    def _run(self, argv: List[str], what: str) -> str:
+        if self.dry_run:
+            log.info("[dry-run] 本应执行：%s", " ".join(argv))
+            return f"{what}: 演练模式未真正执行"
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                timeout=20,
+                creationflags=self._creation_flags(),
+            )
+        except FileNotFoundError:
+            return f"错误：找不到命令 {argv[0]}"
+        except subprocess.TimeoutExpired:
+            return f"错误：{what} 执行超时"
+
+        out = (proc.stdout or b"").decode("gbk", errors="replace").strip()
+        err = (proc.stderr or b"").decode("gbk", errors="replace").strip()
+        if proc.returncode == 0:
+            return f"{what}: 已下达"
+        detail = err or out or f"退出码 {proc.returncode}"
+        if proc.returncode == 1190:
+            detail = "已有待执行的关机计划"
+        elif proc.returncode == 5:
+            detail = "被系统拒绝（可能缺少关机权限）"
+        return f"错误：{what} 失败 - {detail}"
+
+    def _schedule_cancel(self, seconds: int) -> None:
+        """到点后清掉待执行标记（真正的关机由 Windows 自己完成）。"""
+        def worker() -> None:
+            time.sleep(seconds + 1)
+            with self._pending_lock:
+                self.pending_cancel = None
+        t = threading.Thread(target=worker, name="cancel-window", daemon=True)
+        t.start()
+
+    # -- 供协议调用的动作 -------------------------------------------------
+
+    def shutdown(self) -> str:
+        delay = int(self.cfg.get("shutdown_delay_seconds", 10) or 0)
+        delay = max(0, min(delay, 600))
+        if delay == 0:
+            return self._run(["shutdown", "/s", "/t", "0"], "关机")
+        result = self._run(["shutdown", "/s", "/t", str(delay)], "关机")
+        if result.endswith("已下达"):
+            with self._pending_lock:
+                self.pending_cancel = lambda: None
+            self._schedule_cancel(delay)
+            return f"关机: {delay} 秒后执行（可取消）"
+        return result
+
+    def restart(self) -> str:
+        if not self.cfg.get("allow_restart", True):
+            return "错误: 配置已禁用重启"
+        delay = int(self.cfg.get("shutdown_delay_seconds", 10) or 0)
+        delay = max(0, min(delay, 600))
+        result = self._run(["shutdown", "/r", "/t", str(delay)], "重启")
+        if result.endswith("已下达"):
+            with self._pending_lock:
+                self.pending_cancel = lambda: None
+            self._schedule_cancel(delay)
+            return f"重启: {delay} 秒后执行（可取消）"
+        return result
+
+    def cancel(self) -> str:
+        if not self.cfg.get("allow_cancel", True):
+            return "错误: 配置已禁用取消"
+        with self._pending_lock:
+            pending = self.pending_cancel is not None
+        if not pending and not self.dry_run:
+            # 仍然尝试一次，兼容用户手动执行过 shutdown 的情况
+            return self._run(["shutdown", "/a"], "取消关机")
+        result = self._run(["shutdown", "/a"], "取消关机")
+        with self._pending_lock:
+            self.pending_cancel = None
+        return result
+
+    def sleep(self) -> str:
+        if not self.cfg.get("allow_sleep", True):
+            return "错误: 配置已禁用睡眠"
+        if self.dry_run:
+            log.info("[dry-run] 本应让电脑进入睡眠")
+            return "睡眠: 演练模式未真正执行"
+        # 挂起需要系统支持；用 rundll32 调 SetSuspendState
+        return self._run(
+            ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
+            "睡眠",
+        )
+
+    def state(self) -> str:
+        pending = "unknown"
+        try:
+            probe = subprocess.run(
+                ["shutdown", "/a"],
+                capture_output=True,
+                timeout=10,
+                creationflags=self._creation_flags(),
+            )
+            # 没有待执行计划时 /a 会报错，据此推断
+            pending = "no" if probe.returncode != 0 else "yes"
+            if probe.returncode == 0:
+                # 演练模式不该真的取消掉计划，这里只做探测
+                log.info("状态查询：检测到存在待执行的关机计划")
+        except Exception:                              # noqa: BLE001
+            pass
+        with self._pending_lock:
+            local_pending = self.pending_cancel is not None
+        return f"pending={pending} local_window={'yes' if local_pending else 'no'} dry_run={'yes' if self.dry_run else 'no'}"
+
+
+# ---------------------------------------------------------------------------
+# WinRT 装配（延迟导入，便于 --self-test 给出清晰提示）
+# ---------------------------------------------------------------------------
+
+class WinRT:
+    """集中导入并暴露所需的 WinRT 类型，缺失时给出可操作的提示。"""
+
+    def __init__(self) -> None:
+        self.available = False
+        self.error: Optional[str] = None
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            from winrt.windows.devices.bluetooth import BluetoothAdapter, BluetoothError
+            from winrt.windows.devices.bluetooth.advertisement import (
+                BluetoothLEAdvertisementDataSection,
+                BluetoothLEAdvertisementPublisher,
+                BluetoothLEAdvertisementPublisherStatus,
+            )
+            from winrt.windows.devices.bluetooth.genericattributeprofile import (
+                GattCharacteristicProperties,
+                GattLocalCharacteristicParameters,
+                GattProtectionLevel,
+                GattServiceProvider,
+                GattServiceProviderAdvertisingParameters,
+                GattSubscribedClient,
+                GattWriteOption,
+            )
+            from winrt.windows.foundation import Deferral
+            from winrt.windows.storage.streams import DataReader, DataWriter
+
+            self.BluetoothAdapter = BluetoothAdapter
+            self.BluetoothError = BluetoothError
+            self.BluetoothLEAdvertisementDataSection = BluetoothLEAdvertisementDataSection
+            self.BluetoothLEAdvertisementPublisher = BluetoothLEAdvertisementPublisher
+            self.BluetoothLEAdvertisementPublisherStatus = BluetoothLEAdvertisementPublisherStatus
+            self.GattCharacteristicProperties = GattCharacteristicProperties
+            self.GattLocalCharacteristicParameters = GattLocalCharacteristicParameters
+            self.GattProtectionLevel = GattProtectionLevel
+            self.GattServiceProvider = GattServiceProvider
+            self.GattServiceProviderAdvertisingParameters = GattServiceProviderAdvertisingParameters
+            self.GattSubscribedClient = GattSubscribedClient
+            self.GattWriteOption = GattWriteOption
+            self.Deferral = Deferral
+            self.DataReader = DataReader
+            self.DataWriter = DataWriter
+            self.available = True
+        except ImportError as exc:
+            self.error = (
+                f"缺少 WinRT 组件：{exc}\n"
+                "请先安装依赖：\n"
+                "  python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple "
+                "winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections "
+                "winrt-Windows.Storage.Streams winrt-Windows.Devices.Bluetooth "
+                "winrt-Windows.Devices.Bluetooth.GenericAttributeProfile "
+                "winrt-Windows.Devices.Bluetooth.Advertisement"
+            )
+        except Exception as exc:                        # noqa: BLE001
+            self.error = f"加载 WinRT 组件失败：{exc!r}"
+
+
+def buffer_to_bytes(buffer: Any) -> bytes:
+    """把 WinRT IBuffer 转成 Python bytes。"""
+    if buffer is None:
+        return b""
+    from winrt.windows.storage.streams import DataReader  # noqa: PLC0415
+
+    reader = DataReader.from_buffer(buffer)
+    size = int(reader.unconsumed_buffer_length)
+    if size <= 0:
+        return b""
+    return bytes(reader.read_buffer(size))
+
+
+def bytes_to_buffer(payload: bytes) -> Any:
+    """把 Python bytes 转成 WinRT IBuffer。"""
+    from winrt.windows.storage.streams import DataWriter  # noqa: PLC0415
+
+    writer = DataWriter()
+    writer.write_bytes(payload)
+    return writer.detach_buffer()
+
+
+# ---------------------------------------------------------------------------
+# 服务主体
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Session:
+    """一个已订阅通知的客户端。"""
+    client: Any
+    device_id: Optional[str] = None
+    authenticated: bool = False
+    failures: int = 0
+
+    def label(self) -> str:
+        if self.device_id:
+            return f"手机[{self.device_id[-6:]}]"
+        return "手机[未知]"
+
+
+class ShutdownService:
+    def __init__(self, cfg: Dict[str, Any], pin: str, dry_run: bool = False) -> None:
+        self.cfg = cfg
+        self.pin = pin
+        self.dry_run = dry_run
+        self.actions = PowerActions(cfg, dry_run=dry_run)
+
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.rt = WinRT()
+        self.provider: Any = None
+        self.rx_char: Any = None
+        self.tx_char: Any = None
+        self.publisher: Any = None
+
+        self.sessions: List[Session] = []
+        self._sessions_lock = threading.Lock()
+        self.stop_event: Optional[asyncio.Event] = None
+        self.local_ident: dict = {}
+
+        # 全局认证状态：会话识别不出来时的兜底（见 _do_auth 说明）
+        self.authenticated: bool = False
+        self.auth_failures: int = 0
+
+    # ------------------------------------------------------------ 生命周期
+
+    async def start(self) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.stop_event = asyncio.Event()
+
+        rt = self.rt
+        if not rt.available:
+            raise RuntimeError(rt.error or "WinRT 不可用")
+
+        await self._create_service()
+        await self._start_advertising()
+
+    async def _create_service(self) -> None:
+        rt = self.rt
+        result = await rt.GattServiceProvider.create_async(uuid.UUID(SERVICE_UUID))
+        if result.error != rt.BluetoothError.SUCCESS:
+            raise RuntimeError(f"创建 GATT 服务失败：{result.error}")
+        self.provider = result.service_provider
+        service = self.provider.service
+        log.info("GATT 服务已创建：%s", SERVICE_UUID)
+
+        # 手机 -> 电脑：可写
+        rx_params = rt.GattLocalCharacteristicParameters()
+        rx_params.characteristic_properties = (
+            rt.GattCharacteristicProperties.WRITE
+            | rt.GattCharacteristicProperties.WRITE_WITHOUT_RESPONSE
+        )
+        rx_params.write_protection_level = rt.GattProtectionLevel.PLAIN
+        rx_params.user_description = "phone to pc"
+        rx_result = await service.create_characteristic_async(uuid.UUID(RX_UUID), rx_params)
+        if rx_result.error != rt.BluetoothError.SUCCESS:
+            raise RuntimeError(f"创建接收特征失败：{rx_result.error}")
+        self.rx_char = rx_result.characteristic
+        self.rx_char.add_write_requested(self._on_write_requested)
+
+        # 电脑 -> 手机：通知
+        tx_params = rt.GattLocalCharacteristicParameters()
+        tx_params.characteristic_properties = rt.GattCharacteristicProperties.NOTIFY
+        tx_params.read_protection_level = rt.GattProtectionLevel.PLAIN
+        tx_params.user_description = "pc to phone"
+        tx_result = await service.create_characteristic_async(uuid.UUID(TX_UUID), tx_params)
+        if tx_result.error != rt.BluetoothError.SUCCESS:
+            raise RuntimeError(f"创建通知特征失败：{tx_result.error}")
+        self.tx_char = tx_result.characteristic
+        self.tx_char.add_subscribed_clients_changed(self._on_subscribed_changed)
+
+        log.info("特征就绪：RX=%s  TX=%s", RX_UUID, TX_UUID)
+
+    async def _start_advertising(self) -> None:
+        rt = self.rt
+        adv = rt.GattServiceProviderAdvertisingParameters()
+        adv.is_discoverable = True
+        adv.is_connectable = True
+        self.provider.start_advertising_with_parameters(adv)
+        log.info("GATT 服务已开始广播")
+
+        self.local_ident = await self._read_local_adapter()
+        self._start_name_publisher()
+
+    async def _read_local_adapter(self) -> dict:
+        """读出本机蓝牙名与地址，方便用户在手机扫描列表里认出这台电脑。"""
+        info: dict = {}
+        try:
+            adapter = await self.rt.BluetoothAdapter.get_default_async()
+            if adapter is not None:
+                info["address"] = f"{int(adapter.bluetooth_address):012X}"
+                info["peripheral"] = bool(adapter.is_peripheral_role_supported)
+                log.info("本机蓝牙地址：%s（支持外设角色：%s）",
+                         info["address"], info["peripheral"])
+        except Exception as exc:                        # noqa: BLE001
+            log.debug("读取蓝牙适配器信息失败：%r", exc)
+        return info
+
+    def _start_name_publisher(self) -> None:
+        """
+        尝试让手机在扫描结果里看到 "PC-Shutdown" 这个名字。
+
+        实测（Windows 11 build 26200 + WinRT 3.2.1）：
+          - 设 advertisement.local_name  → publisher.start() 抛 参数错误
+          - 加 advertisement.service_uuids → 同样抛 参数错误
+          - 只有 data_sections 能被接受
+        所以这里用自定义数据段承载一个标识，广播内容由手机端解析识别；
+        拿不到漂亮名字也不影响功能，手机端也有兜底（列出全部设备任选）。
+        """
+        try:
+            publisher = self.rt.BluetoothLEAdvertisementPublisher()
+            section = self.rt.BluetoothLEAdvertisementDataSection()
+            section.data_type = 0xFF
+            section.data = bytes_to_buffer(ADVERT_MARKER)
+            publisher.advertisement.data_sections.append(section)
+            # 盯住广播状态：如果被系统或驱动中止，必须立刻可见，
+            # 否则"手机扫不到"会变成无头悬案。
+            publisher.add_status_changed(self._on_publisher_status_changed)
+            publisher.start()
+            self.publisher = publisher
+            log.info("广播中已加入自定义标识段（%s）", ADVERT_MARKER.hex().upper())
+        except Exception as exc:                        # noqa: BLE001
+            self.publisher = None
+            log.info(
+                "未能附加自定义广播标识（%s）。不影响使用："
+                "手机端会列出附近的蓝牙设备，选中这台电脑即可。",
+                exc,
+            )
+
+    def _on_publisher_status_changed(self, sender: Any, args: Any) -> None:
+        try:
+            status = int(sender.status)
+            error = sender.error
+        except Exception:                               # noqa: BLE001
+            return
+        # 0=Created 1=Started 2=Stopping 3=Stopped 4=Aborted
+        if status == 4:
+            log.error(
+                "广播被中止了（error=%s）！手机将搜不到本机。"
+                "常见原因：蓝牙适配器不支持外设模式、或蓝牙被关闭。",
+                error,
+            )
+        else:
+            log.debug("广播状态变化：status=%s error=%s", status, error)
+
+    def request_stop(self) -> None:
+        if self.loop is not None and self.stop_event is not None:
+            self.loop.call_soon_threadsafe(self.stop_event.set)
+
+    async def shutdown(self) -> None:
+        try:
+            if self.publisher is not None:
+                self.publisher.stop()
+        except Exception:                               # noqa: BLE001
+            pass
+        try:
+            if self.provider is not None:
+                self.provider.stop_advertising()
+        except Exception:                               # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------ 事件桥接
+
+    def _dispatch(self, coro) -> None:
+        """把 WinRT 线程上的回调安全地丢回 asyncio 事件循环。"""
+        loop = self.loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError:
+            pass
+
+    def _on_write_requested(self, sender: Any, args: Any) -> None:
+        self._dispatch(self._handle_write(args))
+
+    def _on_subscribed_changed(self, sender: Any, args: Any) -> None:
+        log.info("订阅事件触发：args 类型=%s", type(args).__name__)
+        self._dispatch(self._handle_subscription(args))
+
+    async def _handle_subscription(self, args: Any) -> None:
+        # 该事件的参数在不同 SDK 版本里可能是 GattSubscribedClient 本身，
+        # 也可能包一层；两种形态都兼容。
+        client = args
+        for attr in ("subscribed_client", "SubscribedClient"):
+            inner = getattr(args, attr, None)
+            if inner is not None:
+                client = inner
+                break
+        if client is None:
+            log.warning("订阅事件里拿不到 client，args=%r", args)
+            return
+
+        with self._sessions_lock:
+            session = next((s for s in self.sessions if _same_client(s.client, client)), None)
+            if session is None:
+                session = Session(client=client)
+                session.device_id = _device_key(client)
+                self.sessions.append(session)
+                log.info("客户端已订阅通知：%s（当前 %d 个会话）",
+                         session.label(), len(self.sessions))
+
+        await self._send_line(f"HELLO {PROTOCOL_VERSION} AUTH\n", session)
+
+    async def _handle_write(self, args: Any) -> None:
+        request = None
+        try:
+            request = await args.get_request_async()
+        except Exception as exc:                        # noqa: BLE001
+            log.warning("读取写入请求失败：%r", exc)
+            return
+        if request is None:
+            return
+
+        text = ""
+        try:
+            payload = buffer_to_bytes(request.value)
+            text = payload.decode("utf-8", errors="replace").strip()
+        except Exception as exc:                        # noqa: BLE001
+            log.warning("解码写入内容失败：%r", exc)
+
+        # 每个请求只能应答一次。WriteWithoutResponse 类型的请求不需要（也不能）
+        # 应答，直接调用会抛 "已提交对象"，所以失败就静默降级。
+        try:
+            request.respond()
+        except Exception as exc:                        # noqa: BLE001
+            log.debug("请求无需应答或已应答：%r", exc)
+
+        if not text:
+            return
+
+        try:
+            session = await self._session_from_request(request)
+        except Exception as exc:                        # noqa: BLE001
+            log.warning("识别写入来源失败：%r", exc)
+            session = None
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                await self._handle_command(line, session)
+
+    async def _session_from_request(self, request: Any) -> Optional[Session]:
+        """
+        由一次写入请求反查（必要时新建）会话。
+
+        不能只依赖 subscribed_clients_changed 事件：实测在 Windows 11 + WinRT 3.2.1 上
+        该事件的参数是 None，拿不到客户端。所以从写入请求本身把会话建起来。
+        """
+        client = None
+        for attr in ("session", "Session", "subscribed_client", "SubscribedClient"):
+            try:
+                client = getattr(request, attr, None)
+            except Exception:                           # noqa: BLE001
+                client = None
+            if client is not None:
+                break
+
+        if client is None:
+            # 已知情况：Windows 上 GattWriteRequest 根本不暴露来源客户端
+            # （可用成员里只有 value/offset/state/respond...），所以这里
+            # 只是 DEBUG 记录，不再当成异常刷警告。
+            log.debug("写入请求不含来源客户端，改用全局认证状态判定")
+            return None
+
+        with self._sessions_lock:
+            session = next((s for s in self.sessions if _same_client(s.client, client)), None)
+            if session is None:
+                session = Session(client=client)
+                session.device_id = _device_key(client)
+                self.sessions.append(session)
+                log.info("由写入请求建立会话：%s（当前 %d 个会话）",
+                         session.label(), len(self.sessions))
+            return session
+
+    # ------------------------------------------------------------ 协议
+
+    async def _send_line(self, line: str, session: Optional[Session] = None) -> None:
+        """
+        把一行应答发给手机。
+
+        不再预检"有没有订阅者"：实测 Windows 11 + WinRT 3.2.1 上
+        subscribed_clients / subscribed_clients_changed 都拿不到客户端，
+        预检会把应答静默丢掉（手机就永远等不到 OK AUTH）。
+        直接发，失败才记日志。
+        """
+        payload = line.encode("utf-8")[:RX_BUFFER_LIMIT]
+        try:
+            await self.tx_char.notify_value_async(bytes_to_buffer(payload))
+            log.debug("已发送 %r", line.strip())
+        except Exception as exc:                        # noqa: BLE001
+            log.warning("通知发送失败：%r（手机可能已断开）", exc)
+
+    async def _handle_command(self, line: str, session: Optional[Session]) -> None:
+        parts = line.split()
+        if not parts:
+            return
+        cmd = parts[0].upper()
+        arg = parts[1] if len(parts) > 1 else ""
+        who = session.label() if session else "未知来源"
+        log.info("收到命令：%s %s（来自 %s）", cmd, "*" * len(arg) if cmd == "AUTH" else arg, who)
+
+        if cmd == "HELLO":
+            await self._send_line(f"HELLO {PROTOCOL_VERSION} AUTH\n", session)
+            return
+
+        if cmd == "AUTH":
+            await self._do_auth(arg, session)
+            return
+
+        # 认证判定：优先看会话，无法识别会话时退回到全局认证状态。
+        # 这是个单人使用的关机工具，稳健性比"精确区分是哪个客户端"更重要。
+        authenticated = bool(session is not None and session.authenticated) or self.authenticated
+        if not authenticated:
+            await self._send_line("ERR NEED_AUTH\n", session)
+            return
+
+        if cmd == "PING":
+            await self._send_line("PONG\n", session)
+
+        elif cmd == "QUERY":
+            await self._send_line(f"STATE {self.actions.state()}\n", session)
+
+        elif cmd == "SHUTDOWN":
+            result = self.actions.shutdown()
+            await self._send_line(f"OK {result}\n", session)
+
+        elif cmd == "RESTART":
+            result = self.actions.restart()
+            await self._send_line(f"OK {result}\n", session)
+
+        elif cmd == "SLEEP":
+            await self._send_line("OK 睡眠: 即将进入睡眠\n", session)
+            result = self.actions.sleep()
+            log.info("睡眠结果：%s", result)
+
+        elif cmd == "CANCEL":
+            result = self.actions.cancel()
+            await self._send_line(f"OK {result}\n", session)
+
+        else:
+            await self._send_line(f"ERR UNKNOWN_CMD {cmd}\n", session)
+
+    async def _do_auth(self, arg: str, session: Optional[Session]) -> None:
+        """
+        PIN 校验。
+
+        会话可能识别不出来（Windows 上拿不到来源客户端），所以认证状态
+        同时记一份全局的：只要有人拿着正确 PIN 认证过，就认为这台电脑
+        处于"已被授权控制"状态。
+        """
+        who = session.label() if session else "未知来源"
+
+        if arg == self.pin:
+            if session is not None:
+                with self._sessions_lock:
+                    for other in self.sessions:
+                        if other is not session:
+                            other.authenticated = False
+                session.authenticated = True
+                session.failures = 0
+            self.authenticated = True
+            self.auth_failures = 0
+            log.info("%s 认证成功，已授权控制", who)
+            await self._send_line("OK AUTH\n", session)
+            return
+
+        self.auth_failures += 1
+        if session is not None:
+            session.failures += 1
+            tries = session.failures
+        else:
+            tries = self.auth_failures
+        log.warning("%s 认证失败（第 %d 次）", who, tries)
+        await self._send_line(f"ERR AUTH 第{tries}次失败\n", session)
+
+        if tries >= MAX_AUTH_FAILURES:
+            log.warning("%s 连续失败过多，撤销授权", who)
+            self.authenticated = False
+            with self._sessions_lock:
+                if session is not None and session in self.sessions:
+                    self.sessions.remove(session)
+
+
+def _device_key(client: Any) -> Optional[str]:
+    """取出蓝牙设备标识（BluetoothDeviceId 转字符串）。"""
+    try:
+        device_id = client.session.device_id
+    except Exception:                                   # noqa: BLE001
+        return None
+    if device_id is None:
+        return None
+    raw = getattr(device_id, "id", None)
+    return str(raw) if raw is not None else str(device_id)
+
+
+def _same_client(a: Any, b: Any) -> bool:
+    if a is b:
+        return True
+    ka, kb = _device_key(a), _device_key(b)
+    return ka is not None and ka == kb
+
+
+# ---------------------------------------------------------------------------
+# 自检
+# ---------------------------------------------------------------------------
+
+def run_self_test(cfg: Dict[str, Any]) -> int:
+    print("=" * 68)
+    print("PC-Shutdown 自检")
+    print("=" * 68)
+    ok = True
+
+    print(f"Python      : {sys.version.split()[0]}  ({sys.executable})")
+    print(f"平台        : {sys.platform}")
+    if sys.platform != "win32":
+        print("  ✗ 本服务只能在 Windows 上运行")
+        return 2
+    if sys.getwindowsversion().build < 17763:
+        print("  ! Windows 版本过低（需要 10 1809 / build 17763 及以上）")
+
+    rt = WinRT()
+    if rt.available:
+        print("WinRT 组件  : ✓ 全部可用")
+    else:
+        ok = False
+        print("WinRT 组件  : ✗ 不可用")
+        print(rt.error)
+
+    if rt.available:
+        checks = [
+            ("GattServiceProvider.create_async", hasattr(rt.GattServiceProvider, "create_async")),
+            ("GattLocalCharacteristicParameters.user_description",
+             hasattr(rt.GattLocalCharacteristicParameters(), "user_description")),
+            ("GattLocalCharacteristicParameters.write_protection_level",
+             hasattr(rt.GattLocalCharacteristicParameters(), "write_protection_level")),
+            ("GattServiceProviderAdvertisingParameters.is_discoverable",
+             hasattr(rt.GattServiceProviderAdvertisingParameters(), "is_discoverable")),
+            ("BluetoothLEAdvertisementPublisher", rt.BluetoothLEAdvertisementPublisher is not None),
+        ]
+        for name, good in checks:
+            print(f"  {'✓' if good else '✗'} {name}")
+            ok = ok and good
+
+        try:
+            params = rt.GattLocalCharacteristicParameters()
+            params.user_description = "probe"
+            print("  ✓ 特征参数可写（user_description）")
+        except Exception as exc:                        # noqa: BLE001
+            ok = False
+            print(f"  ✗ 特征参数不可写：{exc!r}")
+
+        try:
+            adv = rt.BluetoothLEAdvertisementPublisher()
+            adv.advertisement.local_name = ADVERTISED_NAME
+            print(f"  ✓ 可设置广播名 {ADVERTISED_NAME}")
+        except Exception as exc:                        # noqa: BLE001
+            print(f"  ! 无法设置广播名：{exc!r}（运行时将退回电脑原始蓝牙名）")
+
+    # 关机命令是否可用（只读探测，不真正关机）
+    probe = PowerActions(cfg, dry_run=True)
+    print(f"演练关机    : {probe.shutdown()}")
+    print(f"演练重启    : {probe.restart()}")
+    print(f"演练取消    : {probe.cancel()}")
+    print(f"状态查询    : {probe.state()}")
+
+    host = socket.gethostname()
+    print(f"主机名      : {host}")
+    print(f"配置        : {CONFIG_PATH if CONFIG_PATH.exists() else '（未创建，将使用默认值）'}")
+    print("=" * 68)
+    print("自检结果    : " + ("通过 ✓" if ok else "存在问题 ✗"))
+    print("=" * 68)
+    return 0 if ok else 1
+
+
+def list_api() -> int:
+    rt = WinRT()
+    if not rt.available:
+        print(rt.error)
+        return 1
+    print("GattServiceProvider 成员：")
+    for name in sorted(dir(rt.GattServiceProvider)):
+        if not name.startswith("_"):
+            print("   ", name)
+    print("\nBluetoothLEAdvertisementPublisher 成员：")
+    for name in sorted(dir(rt.BluetoothLEAdvertisementPublisher)):
+        if not name.startswith("_"):
+            print("   ", name)
+    print("\nGattLocalCharacteristicParameters 成员：")
+    for name in sorted(dir(rt.GattLocalCharacteristicParameters())):
+        if not name.startswith("_"):
+            print("   ", name)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+BANNER = r"""
+  ____   ____    ____  _                     _     _
+ |  _ \ / ___|  / ___|| |__  _   _ _ __   __| | __| | ___ _ __
+ | |_) | |     \___ \| '_ \| | | | '_ \ / _` |/ _` |/ _ \ '_ \
+ |  __/| |___   ___) | | | | |_| | | | | (_| | (_| |  __/ | | |
+ |_|    \____| |____/|_| |_|\__,_|_| |_|\__,_|\__,_|\___|_| |_|
+"""
+
+
+def setup_console_encoding() -> None:
+    """Windows 控制台默认 GBK，中文日志容易花屏，统一切到 UTF-8。"""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:                           # noqa: BLE001
+                pass
+
+
+def setup_logging(level: str) -> None:
+    setup_console_encoding()
+    numeric = getattr(logging, str(level).upper(), logging.INFO)
+    log.setLevel(numeric)
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%H:%M:%S")
+
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(fmt)
+    log.addHandler(stream)
+
+    try:
+        file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        log.addHandler(file_handler)
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
+async def amain(cfg: Dict[str, Any], pin: str, dry_run: bool) -> int:
+    service = ShutdownService(cfg, pin, dry_run=dry_run)
+
+    try:
+        await service.start()
+    except Exception as exc:                            # noqa: BLE001
+        log.error("启动失败：%s", exc)
+        return 1
+
+    print()
+    print(" " + "=" * 62)
+    ident = service.local_ident or {}
+    print(f"  蓝牙地址 : {ident.get('address', '(读取失败)')}")
+    if ident.get("peripheral") is False:
+        print("  ！警告   : 该适配器未报告支持外设角色，手机可能搜不到本机")
+    print(f"  广播标识 : {ADVERT_MARKER.hex().upper()}  （手机 App 靠它认出本机）")
+    print(f"  本次 PIN : {pin}")
+    print(f"  关机延时 : {cfg.get('shutdown_delay_seconds')} 秒（可用「取消关机」撤销）")
+    mode_text = "演练（不会真的关机）" if dry_run else "正常（会真的关机）"
+    print(f"  模式     : {mode_text}")
+    print("  手机操作 : 打开「电脑关机」App → 扫描电脑 → 选中本机 → 连接 → 输入上面的 PIN")
+    print("  退出     : 按 Ctrl+C")
+    print(" " + "=" * 62)
+    print()
+
+    # 同一行也记进日志：本机的 test_e2e.py 靠它自动取 PIN 和运行模式
+    log.info(
+        "配置 地址=%s PIN=%s 延时=%s秒 模式=%s 广播标识=%s",
+        ident.get("address", "unknown"),
+        pin,
+        cfg.get("shutdown_delay_seconds"),
+        "dry-run" if dry_run else "normal",
+        ADVERT_MARKER.hex().upper(),
+    )
+
+    try:
+        await service.stop_event.wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await service.shutdown()
+        log.info("服务已停止")
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="电脑端蓝牙关机服务（手机通过 BLE 控制本机关机）"
+    )
+    parser.add_argument("--dry-run", action="store_true",
+                        help="演练模式：只打印将要执行的命令，不真的关机/重启")
+    parser.add_argument("--self-test", action="store_true",
+                        help="检查依赖与 WinRT API 可用性后退出")
+    parser.add_argument("--list-api", action="store_true",
+                        help="打印本机 WinRT BLE API 清单后退出")
+    parser.add_argument("--pin", default=None,
+                        help="指定本次使用的 PIN（覆盖 config.json）")
+    parser.add_argument("--log-level", default=None,
+                        help="日志级别：DEBUG/INFO/WARNING")
+    args = parser.parse_args(argv)
+
+    cfg = load_config()
+    if args.log_level:
+        cfg["log_level"] = args.log_level
+    setup_logging(cfg.get("log_level", "INFO"))
+
+    if args.self_test:
+        return run_self_test(cfg)
+    if args.list_api:
+        return list_api()
+
+    pin = args.pin.strip() if args.pin else resolve_pin(cfg)
+    if not pin.isdigit() or not (4 <= len(pin) <= 12):
+        log.error("PIN 必须是 4-12 位数字")
+        return 1
+
+    print(BANNER)
+    try:
+        return asyncio.run(amain(cfg, pin, dry_run=args.dry_run))
+    except KeyboardInterrupt:
+        print()
+        log.info("已手动停止")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

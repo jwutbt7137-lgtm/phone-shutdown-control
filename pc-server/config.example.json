@@ -1,0 +1,9 @@
+{
+  "pin": null,
+  "shutdown_delay_seconds": 10,
+  "allow_restart": true,
+  "allow_sleep": true,
+  "allow_cancel": true,
+  "advertised_name": "PC-Shutdown",
+  "log_level": "INFO"
+}

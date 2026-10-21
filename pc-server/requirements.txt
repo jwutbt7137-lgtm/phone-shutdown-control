@@ -1,0 +1,18 @@
+# 电脑端依赖（Windows 10 1809+）
+#
+# 安装：
+#   python -m pip install -r requirements.txt
+#
+# 如果 pypi 官方源慢，用清华镜像：
+#   python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+#
+# 说明：这些是微软官方 WinRT 投影的分包版本，winrt-runtime 是底座，
+#       其余按命名空间拆分，缺哪个就会在 ImportError 里点名，照提示补即可。
+
+winrt-runtime>=3.1.0
+winrt-Windows.Foundation>=3.1.0
+winrt-Windows.Foundation.Collections>=3.1.0
+winrt-Windows.Storage.Streams>=3.1.0
+winrt-Windows.Devices.Bluetooth>=3.1.0
+winrt-Windows.Devices.Bluetooth.GenericAttributeProfile>=3.1.0
+winrt-Windows.Devices.Bluetooth.Advertisement>=3.1.0
