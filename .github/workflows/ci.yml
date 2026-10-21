@@ -47,9 +47,11 @@ jobs:
           java-version: "17"
 
       - uses: android-actions/setup-android@v3
-
-      - name: 安装 SDK 组件
-        run: sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+        with:
+          # 不要用默认的 "tools"：2025 年起 SDK 仓库里已经没有这个包了，
+          # 装了会报 Warning: Failed to find package 'tools'
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
+          accept-android-sdk-licenses: true
 
       - uses: gradle/actions/setup-gradle@v4
 
