@@ -34,7 +34,7 @@ python pc_server.py
 ```
   蓝牙地址 : F0D41577E411
   广播标识 : 5053443101  （手机 App 靠它辅助识别本机）
-  本次 PIN : 128496
+  本次 PIN : 481920
   关机延时 : 10 秒（可用「取消关机」撤销）
   模式     : 正常（会真的关机）
 ```
@@ -46,7 +46,7 @@ python pc_server.py
 - 关机命令默认带 10 秒倒计时，用 App 里的「取消关机」可以撤销。
 
 > **关于蓝牙名**：Windows 不允许第三方应用设置广播名（实测设 `local_name`
-> 直接报"拒绝访问"），所以手机扫描时看到的是电脑的系统蓝牙名（本机是 `RAINBOW`）。
+> 直接报"拒绝访问"），所以手机扫描时看到的是电脑的系统蓝牙名（例如本机是 `RAINBOW`）。
 > App 会记住你连过的电脑名来识别，也可以靠广播标识辅助判断。
 
 ---
@@ -65,11 +65,12 @@ python pc_server.py
 
 ## 四、config.json
 
-已经给你配好了一份（`pc-server\config.json`），关键项：
+仓库里只有示例 `config.example.json`。要用固定 PIN 就复制一份改名 `config.json` 再改
+（`config.json` 已在 `.gitignore` 里，不会被误提交）：
 
 ```json
 {
-  "pin": "128496",
+  "pin": null,
   "shutdown_delay_seconds": 10,
   "allow_restart": true,
   "allow_sleep": true,
@@ -89,7 +90,7 @@ python pc_server.py
 
 1. **PIN 校验**：没通过 `AUTH <pin>` 的连接，发任何控制命令都会被拒绝。
 2. **单控制者**：同一时刻只有一个手机处于已认证状态，新认证会把旧的踢下线。
-3. **防爆破**：同一会话连续输错 5 次 PIN 会被断开。
+3. **防爆破**：同一连接连续输错 5 次 PIN 会锁定 30 秒，之后可重试。
 4. **可撤销**：默认 10 秒倒计时，发现点错了还能救。
 5. 所有动作都会写进 `pc_server.log`（同目录）。
 
@@ -114,4 +115,4 @@ python pc_server.py
 
 - Windows 10 1809（build 17763）或更高，Windows 11 全部支持
 - 电脑要有支持 BLE 外设模式的蓝牙适配器（近几年的笔记本/台式机基本都满足）
-- Python 3.9+（本机实测 3.14.7 正常）
+- Python 3.9+（开发环境实测 3.14 正常；CI 在 3.12 上跑测试）

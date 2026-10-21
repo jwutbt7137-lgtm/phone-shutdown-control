@@ -4,7 +4,11 @@
 BLE 广播探针 —— 只用来看"电脑到底有没有把 BLE 广播发出去"。
 
 用途：在另一个窗口运行 pc_server.py 之后，跑这个脚本，
-      如果能看到 PC-Shutdown，说明电脑端服务确实在广播，手机就能扫到。
+      如果能看到带 ★ 的命中，说明电脑端服务确实在广播，手机就能扫到。
+
+Windows 不允许第三方应用设置广播名，所以电脑端实际是靠广播里的
+自定义数据段 `PSD1`（AD type 0xFF）做标识的；这个脚本两种都认：
+广播名匹配，或者数据段里出现 `PSD1`。
 
 用法：
     python scan_ble.py            # 扫 12 秒
@@ -56,6 +60,28 @@ def main() -> int:
     target_hits = 0
     loop = asyncio.new_event_loop()
 
+    def has_psd1(ev) -> bool:  # noqa: ANN001
+        """广播数据段里是否带 PSD1 标识（电脑端真正的识别依据）。"""
+        try:
+            sections = ev.advertisement.data_sections
+        except Exception:                               # noqa: BLE001
+            return False
+        for section in sections:
+            try:
+                if int(section.data_type) != 0xFF:
+                    continue
+                raw = bytes(
+                    section.data
+                ) if isinstance(section.data, (bytes, bytearray)) else None
+                if raw is None:
+                    from pc_server import buffer_to_bytes
+                    raw = buffer_to_bytes(section.data)
+                if raw.startswith(b"PSD1"):
+                    return True
+            except Exception:                           # noqa: BLE001
+                continue
+        return False
+
     def on_received(_sender, ev: BluetoothLEAdvertisementReceivedEventArgs) -> None:
         nonlocal target_hits
         try:
@@ -65,9 +91,13 @@ def main() -> int:
         except Exception:                               # noqa: BLE001
             return
 
-        if name and args.watch_name.lower() in name.lower():
+        by_name = bool(name) and args.watch_name.lower() in name.lower()
+        by_marker = has_psd1(ev)
+        if by_name or by_marker:
             target_hits += 1
-            print(f"  ★ 命中目标广播：{name}  RSSI={rssi}dBm  addr={address:012X}")
+            tag = "名字" if by_name else "PSD1 标识"
+            print(f"  ★ 命中目标广播（{tag}）：{name or '(无名字)'}  "
+                  f"RSSI={rssi}dBm  addr={address:012X}")
 
         if address not in found or (name and not found[address][0]):
             found[address] = (name, rssi)
@@ -101,6 +131,7 @@ def main() -> int:
             watcher.stop()
         except Exception:                               # noqa: BLE001
             pass
+        loop.close()
 
     print()
     print(f"共发现 {len(found)} 个 BLE 设备：")
@@ -112,9 +143,9 @@ def main() -> int:
 
     print()
     if target_hits:
-        print(f"结果：✓ 检测到「{args.watch_name}」广播 {target_hits} 次 —— 电脑端服务在正常工作")
+        print(f"结果：✓ 检测到目标广播 {target_hits} 次 —— 电脑端服务在正常工作")
         return 0
-    print(f"结果：✗ 没有检测到「{args.watch_name}」广播")
+    print("结果：✗ 没有检测到目标广播（广播名或 PSD1 标识都没命中）")
     print("      请确认 pc_server.py 正在运行（另开一个窗口跑它）")
     return 1
 

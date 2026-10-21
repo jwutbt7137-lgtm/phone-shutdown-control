@@ -43,6 +43,7 @@ class BleClient(private val context: Context, private val listener: Listener) {
     companion object {
         private const val TAG = "BleClient"
         private const val CONNECT_TIMEOUT_MS = 15_000L
+        private const val READY_TIMEOUT_MS = 10_000L
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -66,6 +67,8 @@ class BleClient(private val context: Context, private val listener: Listener) {
         private set
 
     private var connectTimeout: Runnable? = null
+    private var readyTimeout: Runnable? = null
+    private var readySignaled = false
     private val seenAddresses = HashSet<String>()
 
     /** 本次扫描中，通过广播证据认出是"关机服务"的设备数量 */
@@ -407,13 +410,13 @@ class BleClient(private val context: Context, private val listener: Listener) {
             return
         }
         gatt = g
-        armConnectTimeout(address)
+        armConnectTimeout(address, g)
     }
 
-    private fun armConnectTimeout(address: String) {
+    private fun armConnectTimeout(address: String, g: BluetoothGatt) {
         cancelConnectTimeout()
         val r = Runnable {
-            if (!isConnected) {
+            if (gatt === g && !isConnected) {
                 if (isProbing) {
                     Log.d(TAG, "试连超时：$address")
                     probeNext()
@@ -425,6 +428,27 @@ class BleClient(private val context: Context, private val listener: Listener) {
         }
         connectTimeout = r
         main.postDelayed(r, CONNECT_TIMEOUT_MS)
+    }
+
+    /**
+     * 连上之后还要发现服务、订阅通知，这一段以前没有超时：
+     * CCCD 写入没回调时会永远停在"握手中"。这里补一个就绪超时。
+     */
+    private fun armReadyTimeout(g: BluetoothGatt) {
+        cancelReadyTimeout()
+        val r = Runnable {
+            if (gatt === g && !readySignaled) {
+                listener.onLog("通道就绪超时（${READY_TIMEOUT_MS / 1000} 秒）。请重试，或换一台电脑试试")
+                disconnect(notify = true)
+            }
+        }
+        readyTimeout = r
+        main.postDelayed(r, READY_TIMEOUT_MS)
+    }
+
+    private fun cancelReadyTimeout() {
+        readyTimeout?.let { main.removeCallbacks(it) }
+        readyTimeout = null
     }
 
     /**
@@ -446,6 +470,8 @@ class BleClient(private val context: Context, private val listener: Listener) {
     @SuppressLint("MissingPermission")
     fun disconnect(notify: Boolean = true) {
         cancelConnectTimeout()
+        cancelReadyTimeout()
+        readySignaled = false
         val g = gatt
         gatt = null
         rxChar = null
@@ -472,6 +498,11 @@ class BleClient(private val context: Context, private val listener: Listener) {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             main.post {
+                // 迟到的旧连接回调不能污染/关掉新连接
+                if (g !== gatt) {
+                    runCatching { g.close() }
+                    return@post
+                }
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     listener.onLog("连接出错（GATT 状态 $status）")
                 }
@@ -479,6 +510,7 @@ class BleClient(private val context: Context, private val listener: Listener) {
                     BluetoothProfile.STATE_CONNECTED -> {
                         cancelConnectTimeout()
                         isConnected = true
+                        armReadyTimeout(g)
                         val name = try {
                             g.device.name
                         } catch (e: SecurityException) {
@@ -486,10 +518,15 @@ class BleClient(private val context: Context, private val listener: Listener) {
                         }
                         listener.onConnected(name ?: g.device.address)
                         listener.onLog("已连接，正在发现服务…")
-                        try {
+                        val started = try {
                             g.discoverServices()
                         } catch (e: SecurityException) {
                             listener.onLog("发现服务失败：${e.message}")
+                            false
+                        }
+                        if (!started) {
+                            listener.onLog("发起服务发现失败，正在断开重试")
+                            disconnect(notify = true)
                         }
                     }
 
@@ -511,6 +548,10 @@ class BleClient(private val context: Context, private val listener: Listener) {
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             main.post {
+                if (g !== gatt) {
+                    runCatching { g.close() }
+                    return@post
+                }
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     if (isProbing) {
                         probeFail("服务发现失败 $status")
@@ -563,16 +604,28 @@ class BleClient(private val context: Context, private val listener: Listener) {
                         return@post
                     }
                     cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    g.writeDescriptor(cccd)
+                    @Suppress("DEPRECATION")
+                    val writeStarted = g.writeDescriptor(cccd)
+                    if (!writeStarted) {
+                        listener.onLog("订阅通知失败，正在断开重试")
+                        disconnect(notify = true)
+                    }
                 } catch (e: SecurityException) {
                     listener.onLog("配置通知失败：${e.message}")
+                    disconnect(notify = true)
                 }
             }
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             main.post {
+                if (g !== gatt) {
+                    runCatching { g.close() }
+                    return@post
+                }
                 if (status == BluetoothGatt.GATT_SUCCESS) {
+                    readySignaled = true
+                    cancelReadyTimeout()
                     listener.onReady()
                 } else {
                     listener.onLog("通知配置失败（状态 $status）")
@@ -583,6 +636,7 @@ class BleClient(private val context: Context, private val listener: Listener) {
 
         @Deprecated("Android 13 以下走这个回调")
         override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            if (g !== gatt) return
             @Suppress("DEPRECATION")
             val data = characteristic.value ?: return
             deliver(data)
@@ -593,6 +647,7 @@ class BleClient(private val context: Context, private val listener: Listener) {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
+            if (g !== gatt) return
             deliver(value)
         }
 
@@ -619,21 +674,26 @@ class BleClient(private val context: Context, private val listener: Listener) {
 
     // ------------------------------------------------------------------ 收发
 
-    private val lineBuffer = StringBuilder()
+    private val rxBuffer = java.io.ByteArrayOutputStream()
 
     private fun deliver(value: ByteArray) {
-        val text = String(value, Charsets.UTF_8)
         main.post {
-            lineBuffer.append(text)
-            var idx = lineBuffer.indexOf("\n")
-            while (idx >= 0) {
-                val line = lineBuffer.substring(0, idx).trim()
-                lineBuffer.delete(0, idx + 1)
-                if (line.isNotEmpty()) listener.onMessage(line)
-                idx = lineBuffer.indexOf("\n")
+            // 按字节累积到换行再整行解码：MTU 较小时一条中文消息会被拆成多段，
+            // 逐段 String(..., UTF_8) 会解出替换字符。
+            rxBuffer.write(value)
+            val bytes = rxBuffer.toByteArray()
+            var start = 0
+            for (i in bytes.indices) {
+                if (bytes[i] == '\n'.code.toByte()) {
+                    val line = String(bytes, start, i - start, Charsets.UTF_8).trim()
+                    if (line.isNotEmpty()) listener.onMessage(line)
+                    start = i + 1
+                }
             }
+            rxBuffer.reset()
+            if (start < bytes.size) rxBuffer.write(bytes, start, bytes.size - start)
             // 防御：万一电脑端忘了换行，避免缓冲区无限增长
-            if (lineBuffer.length > 4096) lineBuffer.setLength(0)
+            if (rxBuffer.size() > 8192) rxBuffer.reset()
         }
     }
 

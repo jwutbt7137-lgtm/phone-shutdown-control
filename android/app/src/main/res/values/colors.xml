@@ -12,4 +12,5 @@
     <color name="warn_amber">#FFA66A00</color>
     <color name="danger_red">#FFB3261E</color>
     <color name="btn_bg">#FFFFFFFF</color>
+    <color name="ic_launcher_background">#FF1B6E4C</color>
 </resources>

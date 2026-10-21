@@ -22,14 +22,16 @@
         android:required="true" />
 
     <application
-        android:allowBackup="true"
-        android:label="电脑关机"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.PhoneShutdown">
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="电脑关机"
+            android:label="@string/app_name"
             android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

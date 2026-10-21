@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
+import locale
 import logging
 import os
-import random
+import secrets
 import socket
 import subprocess
 import sys
@@ -54,6 +56,7 @@ PROTOCOL_VERSION = 1
 ADVERT_MARKER = b"PSD1" + bytes([PROTOCOL_VERSION])
 
 MAX_AUTH_FAILURES = 5
+AUTH_LOCKOUT_SECONDS = 30
 RX_BUFFER_LIMIT = 512
 
 HERE = Path(__file__).resolve().parent
@@ -94,11 +97,11 @@ def load_config() -> Dict[str, Any]:
 def resolve_pin(cfg: Dict[str, Any]) -> str:
     configured = cfg.get("pin")
     if configured is None or str(configured).strip() == "":
-        return f"{random.randint(0, 999999):06d}"
+        return f"{secrets.randbelow(1_000_000):06d}"
     text = str(configured).strip()
     if not text.isdigit() or not (4 <= len(text) <= 12):
         log.warning("config.json 里的 pin 必须是 4-12 位数字，已改为随机 PIN")
-        return f"{random.randint(0, 999999):06d}"
+        return f"{secrets.randbelow(1_000_000):06d}"
     return text
 
 
@@ -137,8 +140,9 @@ class PowerActions:
         except subprocess.TimeoutExpired:
             return f"错误：{what} 执行超时"
 
-        out = (proc.stdout or b"").decode("gbk", errors="replace").strip()
-        err = (proc.stderr or b"").decode("gbk", errors="replace").strip()
+        encoding = locale.getpreferredencoding(False) or "utf-8"
+        out = (proc.stdout or b"").decode(encoding, errors="replace").strip()
+        err = (proc.stderr or b"").decode(encoding, errors="replace").strip()
         if proc.returncode == 0:
             return f"{what}: 已下达"
         detail = err or out or f"退出码 {proc.returncode}"
@@ -211,24 +215,20 @@ class PowerActions:
         )
 
     def state(self) -> str:
-        pending = "unknown"
-        try:
-            probe = subprocess.run(
-                ["shutdown", "/a"],
-                capture_output=True,
-                timeout=10,
-                creationflags=self._creation_flags(),
-            )
-            # 没有待执行计划时 /a 会报错，据此推断
-            pending = "no" if probe.returncode != 0 else "yes"
-            if probe.returncode == 0:
-                # 演练模式不该真的取消掉计划，这里只做探测
-                log.info("状态查询：检测到存在待执行的关机计划")
-        except Exception:                              # noqa: BLE001
-            pass
+        """
+        只报本地记录的待取消窗口，**绝不**用 `shutdown /a` 去探测。
+
+        早期版本用 `shutdown /a` 的返回码判断"有没有待执行的关机"，这等于
+        查询一次就取消一次：用户在倒计时里点「查询状态」会把刚下达的关机撤掉，
+        `--self-test` 也会误伤系统里已有的关机计划。
+        """
         with self._pending_lock:
             local_pending = self.pending_cancel is not None
-        return f"pending={pending} local_window={'yes' if local_pending else 'no'} dry_run={'yes' if self.dry_run else 'no'}"
+        return (
+            f"pending={'yes' if local_pending else 'no'} "
+            f"local_window={'yes' if local_pending else 'no'} "
+            f"dry_run={'yes' if self.dry_run else 'no'}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -321,11 +321,16 @@ def bytes_to_buffer(payload: bytes) -> Any:
 
 @dataclass
 class Session:
-    """一个已订阅通知的客户端。"""
+    """一个与手机相关的会话。
+
+    Windows 上不一定能拿到客户端句柄，所以 session 可能是匿名兜底，
+    见 `_handle_command` 里的认证判定。
+    """
     client: Any
     device_id: Optional[str] = None
     authenticated: bool = False
     failures: int = 0
+    locked_until: float = 0.0
 
     def label(self) -> str:
         if self.device_id:
@@ -355,12 +360,17 @@ class ShutdownService:
         # 全局认证状态：会话识别不出来时的兜底（见 _do_auth 说明）
         self.authenticated: bool = False
         self.auth_failures: int = 0
+        self._anonymous_warned: bool = False
+        self.auth_locked_until: float = 0.0
+        # 动作串行化：所有关机类命令排队执行，避免两条命令交错
+        self._action_lock: Optional[asyncio.Lock] = None
 
     # ------------------------------------------------------------ 生命周期
 
     async def start(self) -> None:
         self.loop = asyncio.get_running_loop()
         self.stop_event = asyncio.Event()
+        self._action_lock = asyncio.Lock()
 
         rt = self.rt
         if not rt.available:
@@ -501,12 +511,28 @@ class ShutdownService:
         if loop is None or loop.is_closed():
             return
         try:
-            asyncio.run_coroutine_threadsafe(coro, loop)
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
         except RuntimeError:
-            pass
+            return
+        future.add_done_callback(self._log_future_error)
+
+    @staticmethod
+    def _log_future_error(future: Any) -> None:
+        """协程里抛的异常以前会被静默吞掉，命令就"消失"了，这里至少留痕。"""
+        try:
+            future.result()
+        except Exception:                               # noqa: BLE001
+            log.exception("异步任务执行失败")
 
     def _on_write_requested(self, sender: Any, args: Any) -> None:
-        self._dispatch(self._handle_write(args))
+        # WinRT 要求在处理完写入前持有 Deferral，否则响应窗口一过请求就会被提交，
+        # 后面再 respond() 只会抛"对象已提交"。拿不到 Deferral 也不致命（旧实现就是这么跑的）。
+        deferral = None
+        try:
+            deferral = args.get_deferral()
+        except Exception:                               # noqa: BLE001
+            deferral = None
+        self._dispatch(self._handle_write(args, deferral))
 
     def _on_subscribed_changed(self, sender: Any, args: Any) -> None:
         log.info("订阅事件触发：args 类型=%s", type(args).__name__)
@@ -536,7 +562,19 @@ class ShutdownService:
 
         await self._send_line(f"HELLO {PROTOCOL_VERSION} AUTH\n", session)
 
-    async def _handle_write(self, args: Any) -> None:
+    async def _handle_write(self, args: Any, deferral: Any = None) -> None:
+        try:
+            await self._handle_write_inner(args)
+        except Exception:                               # noqa: BLE001
+            log.exception("处理写入请求时出现未捕获异常")
+        finally:
+            if deferral is not None:
+                try:
+                    deferral.complete()
+                except Exception:                       # noqa: BLE001
+                    pass
+
+    async def _handle_write_inner(self, args: Any) -> None:
         request = None
         try:
             request = await args.get_request_async()
@@ -563,36 +601,41 @@ class ShutdownService:
         if not text:
             return
 
-        try:
-            session = await self._session_from_request(request)
-        except Exception as exc:                        # noqa: BLE001
-            log.warning("识别写入来源失败：%r", exc)
-            session = None
+        # WinRT 的 GattWriteRequestedEventArgs 上才有 session；GattWriteRequest 没有。
+        # 两个都试，拿到客户端才能做"按连接"的认证。
+        session = self._session_for(args, request)
         for line in text.splitlines():
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 await self._handle_command(line, session)
+            except Exception:                           # noqa: BLE001
+                log.exception("命令处理失败：%r", line)
+                await self._send_line("ERR INTERNAL\n", session)
 
-    async def _session_from_request(self, request: Any) -> Optional[Session]:
-        """
-        由一次写入请求反查（必要时新建）会话。
-
-        不能只依赖 subscribed_clients_changed 事件：实测在 Windows 11 + WinRT 3.2.1 上
-        该事件的参数是 None，拿不到客户端。所以从写入请求本身把会话建起来。
-        """
-        client = None
+    def _extract_client(self, source: Any) -> Any:
+        if source is None:
+            return None
         for attr in ("session", "Session", "subscribed_client", "SubscribedClient"):
             try:
-                client = getattr(request, attr, None)
+                value = getattr(source, attr, None)
             except Exception:                           # noqa: BLE001
-                client = None
-            if client is not None:
-                break
+                value = None
+            if value is not None:
+                return value
+        return None
 
+    def _session_for(self, args: Any, request: Any) -> Optional[Session]:
+        """
+        由一次写入事件反查（必要时新建）会话。
+
+        优先看事件参数本身：WinRT 把来源客户端放在 GattWriteRequestedEventArgs.Session，
+        而不是 GattWriteRequest 上。以前的实现只查后者，导致永远拿不到客户端、
+        退化成一个全局认证开关。
+        """
+        client = self._extract_client(args) or self._extract_client(request)
         if client is None:
-            # 已知情况：Windows 上 GattWriteRequest 根本不暴露来源客户端
-            # （可用成员里只有 value/offset/state/respond...），所以这里
-            # 只是 DEBUG 记录，不再当成异常刷警告。
             log.debug("写入请求不含来源客户端，改用全局认证状态判定")
             return None
 
@@ -641,9 +684,17 @@ class ShutdownService:
             await self._do_auth(arg, session)
             return
 
-        # 认证判定：优先看会话，无法识别会话时退回到全局认证状态。
-        # 这是个单人使用的关机工具，稳健性比"精确区分是哪个客户端"更重要。
-        authenticated = bool(session is not None and session.authenticated) or self.authenticated
+        # 认证判定：
+        # - 能识别出会话：只认这个会话自己的认证状态，不能借用别人的授权
+        # - 识别不出会话（Windows 上有时候拿不到来源 client）：
+        #   退回全局状态兜底，首次放行时打一条警告，说明当前处于降级模式
+        if session is not None:
+            authenticated = session.authenticated
+        else:
+            authenticated = self.authenticated
+            if authenticated and not self._anonymous_warned:
+                self._anonymous_warned = True
+                log.warning("无法识别写入来源，改用全局认证状态放行（降级模式）")
         if not authenticated:
             await self._send_line("ERR NEED_AUTH\n", session)
             return
@@ -655,36 +706,60 @@ class ShutdownService:
             await self._send_line(f"STATE {self.actions.state()}\n", session)
 
         elif cmd == "SHUTDOWN":
-            result = self.actions.shutdown()
-            await self._send_line(f"OK {result}\n", session)
+            await self._reply_result(await self._run_action(self.actions.shutdown), session)
 
         elif cmd == "RESTART":
-            result = self.actions.restart()
-            await self._send_line(f"OK {result}\n", session)
+            await self._reply_result(await self._run_action(self.actions.restart), session)
 
         elif cmd == "SLEEP":
-            await self._send_line("OK 睡眠: 即将进入睡眠\n", session)
-            result = self.actions.sleep()
-            log.info("睡眠结果：%s", result)
+            if not self.cfg.get("allow_sleep", True):
+                await self._send_line("ERR 错误: 配置已禁用睡眠\n", session)
+            else:
+                # 先回包：真正进入睡眠后 BLE 就断了，等执行完再回会永远收不到
+                await self._send_line("OK 睡眠: 即将进入睡眠\n", session)
+                await asyncio.sleep(0.2)
+                result = await self._run_action(self.actions.sleep)
+                log.info("睡眠结果：%s", result)
 
         elif cmd == "CANCEL":
-            result = self.actions.cancel()
-            await self._send_line(f"OK {result}\n", session)
+            await self._reply_result(await self._run_action(self.actions.cancel), session)
 
         else:
             await self._send_line(f"ERR UNKNOWN_CMD {cmd}\n", session)
+
+    async def _reply_result(self, result: str, session: Optional[Session]) -> None:
+        """成功回 OK，失败回 ERR —— 不能把「错误：...」包装成 OK 发出去。"""
+        prefix = "ERR" if result.startswith("错误") else "OK"
+        await self._send_line(f"{prefix} {result}\n", session)
+
+    async def _run_action(self, func: Callable[[], str]) -> str:
+        """关机类命令会拉起子进程，丢到线程里跑，别卡住 BLE 事件循环。"""
+        if self._action_lock is not None:
+            async with self._action_lock:
+                return await asyncio.to_thread(func)
+        return await asyncio.to_thread(func)
 
     async def _do_auth(self, arg: str, session: Optional[Session]) -> None:
         """
         PIN 校验。
 
-        会话可能识别不出来（Windows 上拿不到来源客户端），所以认证状态
-        同时记一份全局的：只要有人拿着正确 PIN 认证过，就认为这台电脑
-        处于"已被授权控制"状态。
+        有会话身份时按会话计数并锁定；拿不到身份时退回全局计数。
+        会话口径下，认证成功会把其它会话全部踢下线（单控制者）。
         """
         who = session.label() if session else "未知来源"
+        now = time.monotonic()
 
-        if arg == self.pin:
+        if session is not None and session.locked_until > now:
+            await self._send_line(
+                f"ERR AUTH 已锁定，{int(session.locked_until - now) + 1} 秒后再试\n", session)
+            return
+        if session is None and self.auth_locked_until > now:
+            await self._send_line(
+                f"ERR AUTH 已锁定，{int(self.auth_locked_until - now) + 1} 秒后再试\n", session)
+            return
+
+        # 定长比较，避免按字符提前返回带来的时序差异
+        if hmac.compare_digest(arg.encode("utf-8"), self.pin.encode("utf-8")):
             if session is not None:
                 with self._sessions_lock:
                     for other in self.sessions:
@@ -692,39 +767,66 @@ class ShutdownService:
                             other.authenticated = False
                 session.authenticated = True
                 session.failures = 0
+                session.locked_until = 0.0
             self.authenticated = True
             self.auth_failures = 0
+            self.auth_locked_until = 0.0
             log.info("%s 认证成功，已授权控制", who)
             await self._send_line("OK AUTH\n", session)
             return
 
-        self.auth_failures += 1
         if session is not None:
             session.failures += 1
-            tries = session.failures
+            if session.failures >= MAX_AUTH_FAILURES:
+                session.failures = 0
+                session.authenticated = False
+                session.locked_until = now + AUTH_LOCKOUT_SECONDS
+                log.warning("%s 连续失败 %d 次，锁定 %d 秒",
+                            who, MAX_AUTH_FAILURES, AUTH_LOCKOUT_SECONDS)
+            else:
+                log.warning("%s 认证失败（第 %d 次）", who, session.failures)
         else:
-            tries = self.auth_failures
-        log.warning("%s 认证失败（第 %d 次）", who, tries)
-        await self._send_line(f"ERR AUTH 第{tries}次失败\n", session)
+            self.auth_failures += 1
+            if self.auth_failures >= MAX_AUTH_FAILURES:
+                self.auth_failures = 0
+                self.authenticated = False
+                self.auth_locked_until = now + AUTH_LOCKOUT_SECONDS
+                log.warning("匿名来源连续失败 %d 次，锁定 %d 秒",
+                            MAX_AUTH_FAILURES, AUTH_LOCKOUT_SECONDS)
+            else:
+                log.warning("%s 认证失败（第 %d 次）", who, self.auth_failures)
 
-        if tries >= MAX_AUTH_FAILURES:
-            log.warning("%s 连续失败过多，撤销授权", who)
-            self.authenticated = False
-            with self._sessions_lock:
-                if session is not None and session in self.sessions:
-                    self.sessions.remove(session)
+        # 不回具体第几次，减少给爆破者的计数 oracle
+        await self._send_line("ERR AUTH 失败\n", session)
 
 
 def _device_key(client: Any) -> Optional[str]:
-    """取出蓝牙设备标识（BluetoothDeviceId 转字符串）。"""
+    """
+    取出蓝牙设备标识（BluetoothDeviceId 转字符串）。
+
+    WinRT 里两种形态都可能是"客户端"：
+      - GattSubscribedClient：.session.device_id
+      - GattSession：.device_id
+    """
+    candidates = []
     try:
-        device_id = client.session.device_id
+        candidates.append(getattr(client, "session", None))
     except Exception:                                   # noqa: BLE001
-        return None
-    if device_id is None:
-        return None
-    raw = getattr(device_id, "id", None)
-    return str(raw) if raw is not None else str(device_id)
+        pass
+    candidates.append(client)
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            device_id = candidate.device_id
+        except Exception:                               # noqa: BLE001
+            continue
+        if device_id is None:
+            continue
+        raw = getattr(device_id, "id", None)
+        return str(raw) if raw is not None else str(device_id)
+    return None
 
 
 def _same_client(a: Any, b: Any) -> bool:
@@ -862,7 +964,9 @@ def setup_logging(level: str) -> None:
     log.addHandler(stream)
 
     try:
-        file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        from logging.handlers import RotatingFileHandler
+        file_handler = RotatingFileHandler(
+            LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
         file_handler.setFormatter(fmt)
         log.addHandler(file_handler)
     except Exception:                                   # noqa: BLE001
@@ -894,11 +998,10 @@ async def amain(cfg: Dict[str, Any], pin: str, dry_run: bool) -> int:
     print(" " + "=" * 62)
     print()
 
-    # 同一行也记进日志：本机的 test_e2e.py 靠它自动取 PIN 和运行模式
+    # PIN 只显示在控制台，不写进日志文件：日志经常被贴到 Issue 里排障。
     log.info(
-        "配置 地址=%s PIN=%s 延时=%s秒 模式=%s 广播标识=%s",
+        "配置 地址=%s 延时=%s秒 模式=%s 广播标识=%s（PIN 见控制台）",
         ident.get("address", "unknown"),
-        pin,
         cfg.get("shutdown_delay_seconds"),
         "dry-run" if dry_run else "normal",
         ADVERT_MARKER.hex().upper(),

@@ -10,6 +10,49 @@
 - 支持自定义关机倒计时（手机端可调，当前只能改 `config.json`）
 - 多电脑管理（一台手机记住多台已认证电脑）
 
+## [1.1.0] - 2026-10-21
+
+### 新增
+
+- App 图标：自适应图标（绿色电源 + 手机轮廓），补齐 mdpi–xxxhdpi 五套密度
+- 英文 README（`README.en.md`），中文 README 顶部加语言切换
+- `build-apk.ps1` 构建完成后自动把 APK 复制到 `dist\电脑关机-debug.apk`
+- `SECURITY.md` 补充"降级模式"（Windows GATT 拿不到来源客户端）的威胁说明
+
+### 安全
+
+- 随机 PIN 改用 `secrets.randbelow`（密码学安全随机源），不再用 `random`
+- PIN 比较改用 `hmac.compare_digest`，消除按字符提前返回的时序差异
+- 认证边界收紧：能识别出会话时只认该会话自己的认证状态，不再借用全局授权；
+  只有识别不出来源时才退回全局状态，且首次放行会在日志里警告
+- 认证计数改为按连接（连错 5 次锁定 30 秒），不再一错就连坐所有设备
+- PIN 不再写进 `pc_server.log`（日志经常被贴到 Issue 里）
+- `android:allowBackup="false"`：避免手机备份把 PIN 等本地数据带走
+- 手机端只有"和上次认证过的同一台设备（按蓝牙地址）"才自动回放 PIN，
+  换了设备会要求确认，降低被伪造广播钓鱼的风险
+- 手机端日志区对 `AUTH` 命令做脱敏
+- `test_protocol.py` 新增认证边界测试（6 项）
+
+### 修复
+
+- **查询状态不再会取消关机**：原来 `QUERY` 和 `--self-test` 用 `shutdown /a` 探测，
+  等于查一次就取消一次；现在只报本地待取消窗口
+- 关机命令失败时回 `ERR` 而不是把「错误：...」包成 `OK`
+- 写请求取 Deferral，标准 Write With Response 客户端不再超时
+- 关机类命令改为线程池执行，不再阻塞 BLE 事件循环
+- 协程异常不再被静默吞掉，会写进日志
+- 会话身份优先从 `GattWriteRequestedEventArgs.session` 获取（原来只查了
+  GattWriteRequest，永远拿不到来源客户端）
+- 日志改为轮转（1 MB × 3），避免无限增长
+- 修 CI：`android-actions/setup-android@v3` 默认安装的 `tools` 包已从 SDK 仓库移除
+- 手机端：`onDestroy` 停扫描 / 取消自动试连 / 清延时任务；连接后再加 10 秒就绪超时；
+  GATT 回调校验 `gatt` 代际，迟到回调不再影响新连接；通知按字节累积再整行解码，
+  修复中文跨分片乱码；PIN 对话框防重复弹出、防 Activity 销毁后 `show`
+- `scan_ble.py` 同时识别广播名和 `PSD1` 数据段（原来只认名字，永远报 ✗）
+- 两个 `.bat` 用 `py -3` 兜底，不再硬编码 `C:\Python314\python.exe`
+- 文档里 `dist\电脑关机.apk` 与实际产物名不一致
+- `pc-server/README.md` 里写死的示例 PIN 和本机蓝牙名改为通用示例
+
 ## [1.0.0] - 2026-10-21
 
 首个公开版本。

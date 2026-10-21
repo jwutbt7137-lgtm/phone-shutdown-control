@@ -2,6 +2,8 @@
 
 **用手机把电脑关掉。** Android App + Windows 蓝牙 BLE 服务端，不依赖 Wi-Fi、不需要远程桌面、不经过任何云服务。
 
+[English](README.en.md)
+
 [![CI](https://github.com/jwutbt7137-lgtm/phone-shutdown-control/actions/workflows/ci.yml/badge.svg)](https://github.com/jwutbt7137-lgtm/phone-shutdown-control/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/jwutbt7137-lgtm/phone-shutdown-control?color=2ea44f)](https://github.com/jwutbt7137-lgtm/phone-shutdown-control/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
@@ -106,7 +108,7 @@ adb install -r "dist\电脑关机-debug.apk"
 
 - **PIN 认证**：每次启动随机 6 位（也可在 `config.json` 固定），未认证只能收到 `ERR NEED_AUTH`
 - **单控制者**：同一时刻只允许一台手机处于已认证状态，新认证顶掉旧的
-- **防爆破**：同一会话连续输错 5 次即断开
+- **防爆破**：同一连接连续输错 5 次锁定 30 秒；能识别会话时按连接计数，不会误伤其它设备
 - **可撤销**：关机 / 重启默认 10 秒倒计时，点「取消关机」还能救
 - **审计**：所有命令写入 `pc_server.log`
 
@@ -122,7 +124,7 @@ adb install -r "dist\电脑关机-debug.apk"
 │       ├── BleClient.kt      # 扫描 / 连接 / 重连 / 出站队列
 │       └── BleProtocol.kt    # UUID、消息编解码
 ├── pc-server/                # 电脑端：Python + WinRT BLE GATT 服务
-│   ├── pc_server.py          # 服务主体（958 行，含自检与演练模式）
+│   ├── pc_server.py          # 服务主体（含自检与演练模式）
 │   ├── test_protocol.py      # 不碰蓝牙的逻辑测试
 │   ├── test_e2e.py           # 本机扮演手机，端到端走一遍 GATT 链路
 │   ├── scan_ble.py           # 扫描附近 BLE 设备（排查用）

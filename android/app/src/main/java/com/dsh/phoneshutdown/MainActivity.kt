@@ -62,6 +62,8 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
     private val outbox = ArrayDeque<String>()
     private var ready = false
     private var scanning = false
+    private var pinDialog: AlertDialog? = null
+    private var helloHandled = false
 
     private var targetAddress: String? = null
     private var targetName: String? = null
@@ -125,8 +127,17 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacksAndMessages(null)
+        if (::ble.isInitialized) {
+            // 只断 GATT 会留下扫描回调、自动试连队列和延时任务，
+            // 它们继续持有 Activity 引用，且会在后台耗电。
+            ble.stopScan()
+            ble.cancelAutoFind()
+            ble.disconnect(notify = false)
+        }
+        pinDialog?.dismiss()
+        pinDialog = null
         super.onDestroy()
-        if (::ble.isInitialized) ble.disconnect(notify = false)
     }
 
     private fun requestBlePermissions() {
@@ -196,6 +207,9 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
     }
 
     override fun onConnected(deviceName: String?) {
+        helloHandled = false
+        pinDialog?.dismiss()
+        pinDialog = null
         applyStatus("握手中…", R.color.warn_amber)
         deviceLabel.text = deviceName ?: "已连接"
         pinBtn.isEnabled = true
@@ -204,6 +218,7 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
 
     override fun onReady() {
         ready = true
+        helloHandled = false
         applyStatus("未认证", R.color.warn_amber)
         log("通道就绪，发送握手")
         enqueue(BleProtocol.CMD_HELLO)
@@ -259,6 +274,11 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
     }
 
     private fun handleHello(parts: List<String>) {
+        // 电脑端在订阅时推一次 HELLO，手机自己发 HELLO 的应答又是一次，
+        // 不设防会叠出两个 PIN 输入框 / 重复认证。
+        if (helloHandled) return
+        helloHandled = true
+
         val version = parts.getOrNull(1)?.toIntOrNull() ?: 0
         val needAuth = parts.getOrNull(2)?.equals("AUTH", ignoreCase = true) ?: true
 
@@ -271,11 +291,19 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
             log("电脑端未启用 PIN 校验")
             return
         }
+
+        // 只有"和上次认证过的同一台设备（按蓝牙地址）"才自动发 PIN。
+        // 广播名和 PSD1 标识都能伪造，不能拿来当信任依据。
         val saved = prefs.getString(KEY_PIN, null)
-        if (saved != null && PIN_REGEX.matches(saved)) {
-            log("用已保存的 PIN 认证")
+        val savedAddr = prefs.getString(KEY_LAST_ADDR, null)
+        val currentAddr = targetAddress ?: savedAddr
+        val trusted = savedAddr != null && currentAddr != null &&
+            savedAddr.equals(currentAddr, ignoreCase = true)
+        if (saved != null && PIN_REGEX.matches(saved) && trusted) {
+            log("用已保存的 PIN 认证（同一台电脑）")
             enqueue("${BleProtocol.CMD_AUTH} $saved")
         } else {
+            if (saved != null) log("换了设备，请确认设备名称和地址后再输入 PIN")
             applyStatus("需要认证", R.color.warn_amber)
             askForPin(force = false)
         }
@@ -284,6 +312,8 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
     // ------------------------------------------------------------------ PIN 输入
 
     private fun askForPin(force: Boolean) {
+        if (isFinishing || isDestroyed) return
+        if (pinDialog?.isShowing == true) return
         val input = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
             hint = "电脑端窗口显示的 PIN"
@@ -305,7 +335,10 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
 
         val dialog = AlertDialog.Builder(this)
             .setTitle(if (force) "PIN 不正确，请重新输入" else "输入电脑端显示的 PIN")
-            .setMessage("电脑端程序窗口里有一行「本次 PIN」，照抄即可。输入一次后本机自动记住。")
+            .setMessage(
+                "当前设备：${targetName ?: "未知"}（${targetAddress ?: "未知地址"}）\n" +
+                    "电脑端程序窗口里有一行「本次 PIN」，照抄即可。输入一次后本机自动记住。"
+            )
             .setView(holder)
             .setCancelable(false)
             .setPositiveButton("确定", null)
@@ -327,10 +360,20 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
                 enqueue("${BleProtocol.CMD_AUTH} $value")
             }
         }
+        dialog.setOnDismissListener { if (pinDialog === dialog) pinDialog = null }
+        pinDialog = dialog
         dialog.show()
     }
 
     // ------------------------------------------------------------------ 命令
+
+    /** 日志区可以截图、可以复制，PIN 不能原样写进去。 */
+    private fun redact(command: String): String =
+        if (command.startsWith(BleProtocol.CMD_AUTH, ignoreCase = true)) {
+            "${BleProtocol.CMD_AUTH} ****"
+        } else {
+            command
+        }
 
     private fun enqueue(command: String) {
         if (!ble.isConnected) {
@@ -339,16 +382,16 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
         }
         if (!ready) {
             outbox.addLast(command)
-            log("排队等待通道就绪：$command")
+            log("排队等待通道就绪：${redact(command)}")
             return
         }
-        if (ble.send(command)) log("→ $command") else log("发送失败：$command")
+        if (ble.send(command)) log("→ ${redact(command)}") else log("发送失败：${redact(command)}")
     }
 
     private fun drainOutbox() {
         while (ready && outbox.isNotEmpty()) {
             val cmd = outbox.removeFirst()
-            if (ble.send(cmd)) log("→ $cmd") else log("发送失败：$cmd")
+            if (ble.send(cmd)) log("→ ${redact(cmd)}") else log("发送失败：${redact(cmd)}")
         }
     }
 

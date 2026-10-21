@@ -74,8 +74,14 @@ $apk = Get-ChildItem -Path (Join-Path $ProjectDir 'app\build\outputs\apk') -Recu
 
 Write-Host ""
 if ($apk) {
+    # 复制到 dist\，文件名固定，文档和 adb 命令都指向这里
+    $dist = Join-Path $PSScriptRoot 'dist'
+    New-Item -ItemType Directory -Force -Path $dist | Out-Null
+    $dest = Join-Path $dist '电脑关机-debug.apk'
+    Copy-Item -Path $apk.FullName -Destination $dest -Force
     Write-Host "构建成功 ✓" -ForegroundColor Green
     Write-Host ("  APK : {0}" -f $apk.FullName)
+    Write-Host ("  复制: {0}" -f $dest)
     Write-Host ("  大小: {0:N1} MB" -f ($apk.Length / 1MB))
     Write-Host ("  时间: {0}" -f $apk.LastWriteTime)
 } else {

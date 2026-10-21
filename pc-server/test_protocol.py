@@ -182,6 +182,55 @@ finally:
     srv.CONFIG_PATH = original_path
 
 
+# ---------------------------------------------------------------- 认证边界
+print("\n[9] 认证边界")
+
+
+class _Recorder:
+    """把服务发给手机的应答收集起来，代替 tx_char。"""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    async def __call__(self, line: str, session: object = None) -> None:  # noqa: ANN001
+        self.lines.append(line.strip())
+
+
+class _FakeSession:
+    def __init__(self, authenticated: bool = False) -> None:
+        self.authenticated = authenticated
+        self.failures = 0
+        self.device_id = "AA:BB:CC:DD:EE:FF"
+
+    def label(self) -> str:
+        return "手机[测试]"
+
+
+async def _auth_flow() -> list[str]:
+    svc = srv.ShutdownService(dict(srv.DEFAULT_CONFIG), pin="135790", dry_run=True)
+    rec = _Recorder()
+    svc._send_line = rec                                # type: ignore[method-assign]
+
+    await svc._handle_command("PING", None)             # 未认证 + 匿名
+    await svc._handle_command("PING", _FakeSession(False))   # 已识别但未认证
+    await svc._do_auth("000000", None)                  # 错误 PIN
+    await svc._do_auth("135790", None)                  # 正确 PIN
+    await svc._handle_command("PING", None)             # 全局已认证 + 匿名
+    await svc._handle_command("PING", _FakeSession(False))   # 不能借用全局授权
+    return rec.lines
+
+
+import asyncio  # noqa: E402
+
+_auth_lines = asyncio.run(_auth_flow())
+check("未认证的匿名请求被拒", _auth_lines[0].startswith("ERR NEED_AUTH"), _auth_lines[0])
+check("未认证的已识别会话被拒", _auth_lines[1].startswith("ERR NEED_AUTH"), _auth_lines[1])
+check("错误 PIN 返回认证失败", _auth_lines[2].startswith("ERR AUTH"), _auth_lines[2])
+check("正确 PIN 返回 OK AUTH", _auth_lines[3] == "OK AUTH", _auth_lines[3])
+check("全局认证后匿名请求放行", _auth_lines[4] == "PONG", _auth_lines[4])
+check("已识别但未认证的会话仍被拒", _auth_lines[5].startswith("ERR NEED_AUTH"), _auth_lines[5])
+
+
 # ---------------------------------------------------------------- 汇总
 print("\n" + "=" * 60)
 print(f"通过 {PASSED} 项")

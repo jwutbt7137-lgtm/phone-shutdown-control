@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import re
 import sys
 import time
@@ -78,26 +79,19 @@ def print_local_limit_hint() -> None:
 
 
 def read_last_config_line() -> Optional[str]:
-    """读出日志里最近一次「配置 ...」行（由 pc_server.py 启动时写入）。"""
+    """读出日志里最近一次「配置 ...」行（由 pc_server.py 启动时写入，不含 PIN）。"""
     if not LOG_PATH.exists():
         return None
     try:
         text = LOG_PATH.read_text(encoding="utf-8", errors="replace")
     except Exception:                                   # noqa: BLE001
         return None
-    hits = re.findall(r"配置[^\n]*PIN=(\d{4,12})[^\n]*模式=([\w-]+)", text)
-    return f"{hits[-1][0]}|{hits[-1][1]}" if hits else None
-
-
-def read_pin_from_log() -> Optional[str]:
-    """从日志里找出最近一次启动使用的 PIN。"""
-    line = read_last_config_line()
-    return line.split("|")[0] if line else None
+    hits = re.findall(r"配置[^\n]*模式=([\w-]+)", text)
+    return hits[-1] if hits else None
 
 
 def log_says_dry_run() -> bool:
-    line = read_last_config_line()
-    return bool(line and line.split("|")[1] == "dry-run")
+    return read_last_config_line() == "dry-run"
 
 
 async def get_local_address() -> Optional[str]:
@@ -322,7 +316,8 @@ async def run(address: str, pin: Optional[str], allow_power: bool) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="本机 BLE 端到端自测")
     parser.add_argument("--address", default=None, help="目标蓝牙地址，默认取本机")
-    parser.add_argument("--pin", default=None, help="认证 PIN，默认从 pc_server.log 里找")
+    parser.add_argument("--pin", default=None,
+                        help="认证 PIN；也可以用环境变量 PC_SHUTDOWN_PIN")
     parser.add_argument("--allow-power", action="store_true",
                         help="即使不是演练模式也测试关机命令（危险，默认关闭）")
     args = parser.parse_args()
@@ -339,11 +334,12 @@ def main() -> int:
         return 2
 
     print(f"目标蓝牙地址：{address}")
-    pin = args.pin or read_pin_from_log()
+    pin = args.pin or os.environ.get("PC_SHUTDOWN_PIN")
     if pin:
-        print(f"使用的 PIN  ：{pin}（来源：{'命令行' if args.pin else 'pc_server.log'}）")
+        print(f"使用的 PIN  ：{pin}（来源：{'命令行' if args.pin else '环境变量 PC_SHUTDOWN_PIN'}）")
     else:
-        print("未找到 PIN：服务可能没在运行，或用 --pin 指定")
+        print("未找到 PIN：用 --pin 指定，或设置环境变量 PC_SHUTDOWN_PIN")
+        print("（PIN 不再写进 pc_server.log，看服务窗口里那 6 位数）")
 
     dry = log_says_dry_run()
     allow_power = args.allow_power or dry
