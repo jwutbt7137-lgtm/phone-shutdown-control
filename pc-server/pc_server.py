@@ -228,11 +228,7 @@ class PowerActions:
     def cancel(self) -> str:
         if not self.cfg.get("allow_cancel", True):
             return "错误: 配置已禁用取消"
-        with self._pending_lock:
-            pending = self.pending_cancel is not None
-        if not pending and not self.dry_run:
-            # 仍然尝试一次，兼容用户手动执行过 shutdown 的情况
-            return self._run(["shutdown", "/a"], "取消关机")
+        # 不管本地有没有记录都试一次：用户可能在别处手动下过 shutdown
         result = self._run(["shutdown", "/a"], "取消关机")
         with self._pending_lock:
             self.pending_cancel = None
