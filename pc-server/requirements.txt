@@ -9,7 +9,7 @@
 # 说明：这些是微软官方 WinRT 投影的分包版本，winrt-runtime 是底座，
 #       其余按命名空间拆分，缺哪个就会在 ImportError 里点名，照提示补即可。
 
-winrt-runtime>=3.1.0
+winrt-runtime>=3.2.1
 winrt-Windows.Foundation>=3.1.0
 winrt-Windows.Foundation.Collections>=3.1.0
 winrt-Windows.Storage.Streams>=3.1.0
