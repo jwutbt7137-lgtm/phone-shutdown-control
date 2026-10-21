@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: 构建并发布 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
+          accept-android-sdk-licenses: true
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: 构建 debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: 记录版本信息
+        run: |
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK" | head -1
+
+      - name: 创建 Release 并上传 APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -e
+          SRC=android/app/build/outputs/apk/debug/app-debug.apk
+          DEST="phone-shutdown-${TAG}-debug.apk"
+          cp "$SRC" "$DEST"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" "$DEST#Android debug APK" \
+              --title "$TAG" --generate-notes --verify-tag
+          else
+            gh release upload "$TAG" "$DEST" --clobber
+          fi

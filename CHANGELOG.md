@@ -10,6 +10,24 @@
 - 手机端可调的关机倒计时
 - 多电脑管理（一台手机记住多台已认证电脑）
 
+## [1.3.0] - 2026-10-21
+
+### 新增
+
+- **Release 自动化**：推送 `v*` tag 时自动构建 APK 并创建 Release、上传安装包
+  （`.github/workflows/release.yml`，用仓库自带 `GITHUB_TOKEN`，不需要另配密钥）
+- 手机端连接成功后请求 MTU 247，长消息的通知条数更少
+
+### 修复
+
+- **通知按 MTU 安全分片**：服务端按 20 字节切分（不切断 UTF-8 字符），
+  长中文消息不再丢包或出现替换字符；接收端本来就按 `\n` 拼接，新旧 App 都兼容
+- `AUTH2` 的 HMAC 也像 `AUTH` 一样在日志里打码
+
+### 工程
+
+- CI 增加 `python -m compileall` 语法检查
+
 ## [1.2.0] - 2026-10-21
 
 ### 新增
@@ -102,7 +120,8 @@
   - GitHub Actions：Python 逻辑测试 + Android 构建
   - MIT 许可证
 
-[Unreleased]: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/releases/tag/v1.0.0

@@ -34,6 +34,9 @@ jobs:
         working-directory: pc-server
         run: python test_protocol.py
 
+      - name: 语法编译检查
+        run: python -m compileall -q pc-server
+
   android-build:
     name: Android 构建
     runs-on: ubuntu-latest

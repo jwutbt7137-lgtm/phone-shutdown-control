@@ -268,6 +268,19 @@ check("配置返回完整键",
       all(k in _v_ok for k in ("pin", "shutdown_delay_seconds", "allow_restart")))
 
 
+# ---------------------------------------------------------------- 通知分片
+print("\n[11] 通知分片（BLE 单包上限）")
+_payload = "OK 关机: 10 秒后执行（可取消）\n".encode("utf-8")
+_chunks = srv._chunk_utf8(_payload, srv.NOTIFY_CHUNK_BYTES)
+check("每片不超过单包上限",
+      all(len(c) <= srv.NOTIFY_CHUNK_BYTES for c in _chunks),
+      str([len(c) for c in _chunks]))
+check("拼回后与原文一致", b"".join(_chunks) == _payload)
+check("每一片都是合法 UTF-8",
+      all(c.decode("utf-8") for c in _chunks))
+check("空数据返回空列表", srv._chunk_utf8(b"", 20) == [])
+
+
 # ---------------------------------------------------------------- 汇总
 print("\n" + "=" * 60)
 print(f"通过 {PASSED} 项")

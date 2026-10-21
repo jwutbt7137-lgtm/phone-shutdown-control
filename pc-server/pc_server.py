@@ -59,8 +59,10 @@ ADVERT_MARKER = b"PSD1" + bytes([PROTOCOL_VERSION])
 
 MAX_AUTH_FAILURES = 5
 AUTH_LOCKOUT_SECONDS = 30
-RX_BUFFER_LIMIT = 512
 MAX_LINES_PER_WRITE = 4
+# BLE 通知单包上限取决于协商 MTU，默认 23 时有效负载只有 20 字节。
+# 按 20 字节切片最保险；接收端会按行拼接，自动兼容新旧 App。
+NOTIFY_CHUNK_BYTES = 20
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
@@ -325,6 +327,33 @@ class WinRT:
             )
         except Exception as exc:                        # noqa: BLE001
             self.error = f"加载 WinRT 组件失败：{exc!r}"
+
+
+def _chunk_utf8(data: bytes, limit: int) -> List[bytes]:
+    """
+    按 UTF-8 字符边界切片。
+
+    BLE 通知单包不能超过 (MTU-3) 字节，直接发长文本要么被拒、要么在
+    多字节字符中间断开发送方，接收端拼回来就是乱码。这里保证每一片
+    都落在字符边界上，接收端按 '\\n' 拼接后再整行解码。
+    """
+    if not data:
+        return []
+    if limit <= 0:
+        return [data]
+    chunks: List[bytes] = []
+    start = 0
+    total = len(data)
+    while start < total:
+        end = min(start + limit, total)
+        # 0x80-0xBF 是 UTF-8 续字节，往回退到字符起始位置
+        while end < total and end > start and (data[end] & 0xC0) == 0x80:
+            end -= 1
+        if end == start:                                # 理论上不会发生
+            end = min(start + limit, total)
+        chunks.append(data[start:end])
+        start = end
+    return chunks
 
 
 def buffer_to_bytes(buffer: Any) -> bytes:
@@ -700,9 +729,10 @@ class ShutdownService:
         预检会把应答静默丢掉（手机就永远等不到 OK AUTH）。
         直接发，失败才记日志。
         """
-        payload = line.encode("utf-8")[:RX_BUFFER_LIMIT]
+        payload = line.encode("utf-8")
         try:
-            await self.tx_char.notify_value_async(bytes_to_buffer(payload))
+            for chunk in _chunk_utf8(payload, NOTIFY_CHUNK_BYTES):
+                await self.tx_char.notify_value_async(bytes_to_buffer(chunk))
             log.debug("已发送 %r", line.strip())
         except Exception as exc:                        # noqa: BLE001
             log.warning("通知发送失败：%r（手机可能已断开）", exc)
@@ -714,7 +744,8 @@ class ShutdownService:
         cmd = parts[0].upper()
         arg = parts[1] if len(parts) > 1 else ""
         who = session.label() if session else "未知来源"
-        log.info("收到命令：%s %s（来自 %s）", cmd, "*" * len(arg) if cmd == "AUTH" else arg, who)
+        log.info("收到命令：%s %s（来自 %s）", cmd,
+                 "*" * len(arg) if cmd in ("AUTH", "AUTH2") else arg, who)
 
         if cmd == "HELLO":
             await self._send_line(self._hello_line(session), session)

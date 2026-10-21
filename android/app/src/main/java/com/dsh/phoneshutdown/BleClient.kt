@@ -530,6 +530,10 @@ class BleClient(private val context: Context, private val listener: Listener) {
                         cancelConnectTimeout()
                         isConnected = true
                         armReadyTimeout(g)
+                        // 争取更大的 MTU：服务端按 20 字节切片也能工作，
+                        // 协商成功的话长消息的通知条数会少一些。
+                        runCatching { g.requestMtu(247) }
+                            .onFailure { Log.d(TAG, "requestMtu 失败：${it.message}") }
                         val name = try {
                             g.device.name
                         } catch (e: SecurityException) {
