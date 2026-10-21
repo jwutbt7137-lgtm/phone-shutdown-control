@@ -89,6 +89,9 @@ Grant the "Nearby devices" permission on first launch (Android 12+ uses `BLUETOO
 ## Security model
 
 - **PIN auth**: random 6 digits per run (or fixed in `config.json`); unauthenticated clients only get `ERR NEED_AUTH`
+- **PIN never leaves the phone**: protocol v2 authenticates with `HMAC-SHA256(PIN, nonce)`;
+  the nonce rotates after every attempt, so answers cannot be replayed (legacy apps may still
+  send the plaintext `AUTH`; the server logs a warning)
 - **Single controller**: one authenticated phone at a time, new auth kicks the old one
 - **Brute-force lockout**: 5 wrong PINs disconnect the session
 - **Undo window**: 10 s countdown before shutdown/restart

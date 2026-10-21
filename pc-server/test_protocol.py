@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import sys
 import tempfile
@@ -106,7 +108,7 @@ check("延时为 0 时也走演练路径", "演练" in dry4.shutdown())
 print("\n[5] 协议契约")
 check("服务 UUID 长度正确", len(srv.SERVICE_UUID) == 36)
 check("RX/TX UUID 不同", srv.RX_UUID != srv.TX_UUID)
-check("协议版本为 1", srv.PROTOCOL_VERSION == 1)
+check("协议版本为 2", srv.PROTOCOL_VERSION == 2)
 check("最大认证失败次数 >= 3", srv.MAX_AUTH_FAILURES >= 3)
 
 for name in ("SERVICE_UUID", "RX_UUID", "TX_UUID"):
@@ -229,6 +231,41 @@ check("错误 PIN 返回认证失败", _auth_lines[2].startswith("ERR AUTH"), _a
 check("正确 PIN 返回 OK AUTH", _auth_lines[3] == "OK AUTH", _auth_lines[3])
 check("全局认证后匿名请求放行", _auth_lines[4] == "PONG", _auth_lines[4])
 check("已识别但未认证的会话仍被拒", _auth_lines[5].startswith("ERR NEED_AUTH"), _auth_lines[5])
+
+
+async def _hmac_flow() -> list[str]:
+    svc = srv.ShutdownService(dict(srv.DEFAULT_CONFIG), pin="135790", dry_run=True)
+    rec = _Recorder()
+    svc._send_line = rec                                # type: ignore[method-assign]
+
+    nonce = svc._nonce_for(None)
+    good = hmac.new(b"135790", nonce.encode("utf-8"), hashlib.sha256).hexdigest()
+    await svc._do_auth_hmac("deadbeef", None)           # 错误应答
+    await svc._do_auth_hmac(good, None)                 # 正确应答
+    await svc._do_auth_hmac(good, None)                 # 重放：nonce 已轮换
+    hello = svc._hello_line(None)
+    return [*rec.lines, hello.strip()]
+
+
+_hmac_lines = asyncio.run(_hmac_flow())
+check("HMAC 错误应答被拒", _hmac_lines[0].startswith("ERR AUTH"), _hmac_lines[0])
+check("HMAC 正确应答通过", _hmac_lines[1] == "OK AUTH", _hmac_lines[1])
+check("HMAC 重放被拒（nonce 已轮换）", _hmac_lines[2].startswith("ERR AUTH"), _hmac_lines[2])
+check("HELLO 带 nonce 且版本为 2",
+      _hmac_lines[3].startswith("HELLO 2 AUTH ") and len(_hmac_lines[3].split()) == 4,
+      _hmac_lines[3])
+
+
+# ---------------------------------------------------------------- 配置校验
+print("\n[10] config.json 类型校验")
+_v_ok = srv.load_config()
+check("布尔字符串 false 转 False",
+      srv._as_bool("false", True) is False and srv._as_bool("true", False) is True)
+check("非法延时回退默认值", srv._as_int("abc", 10, 0, 600) == 10)
+check("延时范围被夹紧",
+      srv._as_int(9999, 10, 0, 600) == 600 and srv._as_int(-5, 10, 0, 600) == 0)
+check("配置返回完整键",
+      all(k in _v_ok for k in ("pin", "shutdown_delay_seconds", "allow_restart")))
 
 
 # ---------------------------------------------------------------- 汇总

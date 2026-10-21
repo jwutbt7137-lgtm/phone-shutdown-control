@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import hmac
 import json
 import locale
@@ -48,7 +49,7 @@ RX_UUID = "0000a002-1e4b-4f6a-9c3d-2b7e5a8f0c11"   # 手机 -> 电脑（写入�
 TX_UUID = "0000a003-1e4b-4f6a-9c3d-2b7e5a8f0c11"   # 电脑 -> 手机（通知）
 
 ADVERTISED_NAME = "PC-Shutdown"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # 广播数据段里的自定义标识（AD type 0xFF）。
 # 手机端解析到这段字节就说明"这台就是关机服务"。
@@ -58,6 +59,7 @@ ADVERT_MARKER = b"PSD1" + bytes([PROTOCOL_VERSION])
 MAX_AUTH_FAILURES = 5
 AUTH_LOCKOUT_SECONDS = 30
 RX_BUFFER_LIMIT = 512
+MAX_LINES_PER_WRITE = 4
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
@@ -80,6 +82,28 @@ log = logging.getLogger("pc-shutdown")
 # 配置
 # ---------------------------------------------------------------------------
 
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return True
+        if text in ("false", "0", "no", "off"):
+            return False
+    return default
+
+
+def _as_int(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(number, high))
+
+
 def load_config() -> Dict[str, Any]:
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
@@ -91,6 +115,15 @@ def load_config() -> Dict[str, Any]:
                 log.warning("config.json 顶层不是对象，已忽略，使用默认配置")
         except Exception as exc:                      # noqa: BLE001
             log.warning("config.json 解析失败(%s)，使用默认配置", exc)
+
+    # 类型和范围都收一遍：JSON 里写 "false" 不会变成 False，
+    # 写 "abc" 当延时会直接把服务炸在启动阶段。
+    cfg["shutdown_delay_seconds"] = _as_int(
+        cfg.get("shutdown_delay_seconds"), DEFAULT_CONFIG["shutdown_delay_seconds"], 0, 600)
+    for key in ("allow_restart", "allow_sleep", "allow_cancel"):
+        cfg[key] = _as_bool(cfg.get(key), bool(DEFAULT_CONFIG[key]))
+    if not isinstance(cfg.get("advertised_name"), str) or not cfg["advertised_name"].strip():
+        cfg["advertised_name"] = ADVERTISED_NAME
     return cfg
 
 
@@ -331,6 +364,7 @@ class Session:
     authenticated: bool = False
     failures: int = 0
     locked_until: float = 0.0
+    nonce: str = ""
 
     def label(self) -> str:
         if self.device_id:
@@ -362,6 +396,7 @@ class ShutdownService:
         self.auth_failures: int = 0
         self._anonymous_warned: bool = False
         self.auth_locked_until: float = 0.0
+        self.anon_nonce: str = ""
         # 动作串行化：所有关机类命令排队执行，避免两条命令交错
         self._action_lock: Optional[asyncio.Lock] = None
 
@@ -560,7 +595,7 @@ class ShutdownService:
                 log.info("客户端已订阅通知：%s（当前 %d 个会话）",
                          session.label(), len(self.sessions))
 
-        await self._send_line(f"HELLO {PROTOCOL_VERSION} AUTH\n", session)
+        await self._send_line(self._hello_line(session), session)
 
     async def _handle_write(self, args: Any, deferral: Any = None) -> None:
         try:
@@ -604,10 +639,14 @@ class ShutdownService:
         # WinRT 的 GattWriteRequestedEventArgs 上才有 session；GattWriteRequest 没有。
         # 两个都试，拿到客户端才能做"按连接"的认证。
         session = self._session_for(args, request)
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
+
+        lines = [chunk.strip() for chunk in text.splitlines() if chunk.strip()]
+        if len(lines) > MAX_LINES_PER_WRITE:
+            # 一次写入塞几十条 AUTH 会绕过"连错 5 次"的节奏
+            log.warning("单次写入 %d 条命令，只处理前 %d 条", len(lines), MAX_LINES_PER_WRITE)
+            lines = lines[:MAX_LINES_PER_WRITE]
+
+        for line in lines:
             try:
                 await self._handle_command(line, session)
             except Exception:                           # noqa: BLE001
@@ -677,11 +716,15 @@ class ShutdownService:
         log.info("收到命令：%s %s（来自 %s）", cmd, "*" * len(arg) if cmd == "AUTH" else arg, who)
 
         if cmd == "HELLO":
-            await self._send_line(f"HELLO {PROTOCOL_VERSION} AUTH\n", session)
+            await self._send_line(self._hello_line(session), session)
             return
 
         if cmd == "AUTH":
             await self._do_auth(arg, session)
+            return
+
+        if cmd == "AUTH2":
+            await self._do_auth_hmac(arg, session)
             return
 
         # 认证判定：
@@ -741,46 +784,90 @@ class ShutdownService:
 
     async def _do_auth(self, arg: str, session: Optional[Session]) -> None:
         """
-        PIN 校验。
+        兼容协议 v1 的明文 PIN 认证。
 
-        有会话身份时按会话计数并锁定；拿不到身份时退回全局计数。
-        会话口径下，认证成功会把其它会话全部踢下线（单控制者）。
+        只在旧版 App 上出现；建议升级到 v1.2.0+（走 AUTH2 的 HMAC 应答），
+        PIN 就不会再出现在蓝牙链路上。
         """
-        who = session.label() if session else "未知来源"
-        now = time.monotonic()
-
-        if session is not None and session.locked_until > now:
-            await self._send_line(
-                f"ERR AUTH 已锁定，{int(session.locked_until - now) + 1} 秒后再试\n", session)
+        if await self._auth_rejected(session):
             return
-        if session is None and self.auth_locked_until > now:
-            await self._send_line(
-                f"ERR AUTH 已锁定，{int(self.auth_locked_until - now) + 1} 秒后再试\n", session)
-            return
-
-        # 定长比较，避免按字符提前返回带来的时序差异
         if hmac.compare_digest(arg.encode("utf-8"), self.pin.encode("utf-8")):
+            log.warning("%s 使用旧版明文 PIN 认证（协议 v1），建议升级 App",
+                        self._who(session))
+            await self._auth_grant(session)
+        else:
+            await self._auth_deny(session)
+
+    async def _do_auth_hmac(self, arg: str, session: Optional[Session]) -> None:
+        """
+        协议 v2：手机回 HMAC-SHA256(PIN, nonce)，PIN 本身不上链路。
+
+        nonce 存在时要求 AUTH2；旧 App 发 AUTH 仍可用，但会记警告。
+        """
+        if await self._auth_rejected(session):
+            return
+        nonce = self._nonce_for(session, create=False)
+        if nonce:
+            expected = hmac.new(
+                self.pin.encode("utf-8"), nonce.encode("utf-8"), hashlib.sha256
+            ).hexdigest()
+            if hmac.compare_digest(arg.strip().lower(), expected):
+                await self._auth_grant(session)
+                return
+        await self._auth_deny(session)
+
+    @staticmethod
+    def _who(session: Optional[Session]) -> str:
+        return session.label() if session else "未知来源"
+
+    def _nonce_for(self, session: Optional[Session], create: bool = True) -> str:
+        if session is not None:
+            if not session.nonce and create:
+                session.nonce = secrets.token_hex(16)
+            return session.nonce
+        if not self.anon_nonce and create:
+            self.anon_nonce = secrets.token_hex(16)
+        return self.anon_nonce
+
+    def _hello_line(self, session: Optional[Session]) -> str:
+        return f"HELLO {PROTOCOL_VERSION} AUTH {self._nonce_for(session)}\n"
+
+    async def _auth_rejected(self, session: Optional[Session]) -> bool:
+        now = time.monotonic()
+        locked = session.locked_until if session is not None else self.auth_locked_until
+        if locked > now:
+            await self._send_line(
+                f"ERR AUTH 已锁定，{int(locked - now) + 1} 秒后再试\n", session)
+            return True
+        return False
+
+    async def _auth_grant(self, session: Optional[Session]) -> None:
+        with self._sessions_lock:
             if session is not None:
-                with self._sessions_lock:
-                    for other in self.sessions:
-                        if other is not session:
-                            other.authenticated = False
+                for other in self.sessions:
+                    if other is not session:
+                        other.authenticated = False
                 session.authenticated = True
                 session.failures = 0
                 session.locked_until = 0.0
-            self.authenticated = True
-            self.auth_failures = 0
-            self.auth_locked_until = 0.0
-            log.info("%s 认证成功，已授权控制", who)
-            await self._send_line("OK AUTH\n", session)
-            return
+                session.nonce = ""
+        self.authenticated = True
+        self.auth_failures = 0
+        self.auth_locked_until = 0.0
+        self.anon_nonce = ""
+        log.info("%s 认证成功，已授权控制", self._who(session))
+        await self._send_line("OK AUTH\n", session)
 
+    async def _auth_deny(self, session: Optional[Session]) -> None:
+        now = time.monotonic()
+        who = self._who(session)
         if session is not None:
             session.failures += 1
             if session.failures >= MAX_AUTH_FAILURES:
                 session.failures = 0
                 session.authenticated = False
                 session.locked_until = now + AUTH_LOCKOUT_SECONDS
+                session.nonce = ""      # 换 nonce：锁定期间的旧应答不能复用
                 log.warning("%s 连续失败 %d 次，锁定 %d 秒",
                             who, MAX_AUTH_FAILURES, AUTH_LOCKOUT_SECONDS)
             else:
@@ -791,6 +878,7 @@ class ShutdownService:
                 self.auth_failures = 0
                 self.authenticated = False
                 self.auth_locked_until = now + AUTH_LOCKOUT_SECONDS
+                self.anon_nonce = ""
                 log.warning("匿名来源连续失败 %d 次，锁定 %d 秒",
                             MAX_AUTH_FAILURES, AUTH_LOCKOUT_SECONDS)
             else:

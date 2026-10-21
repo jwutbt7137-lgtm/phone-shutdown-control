@@ -35,12 +35,29 @@ object BleProtocol {
     )
 
     /** 电脑端版本，协议不匹配时手机可以提示升级 */
-    const val PROTOCOL_VERSION: Int = 1
+    const val PROTOCOL_VERSION: Int = 2
 
     // ---- 命令字（手机 -> 电脑） ----
 
     const val CMD_HELLO = "HELLO"
     const val CMD_AUTH = "AUTH"
+    const val CMD_AUTH2 = "AUTH2"
+
+    /**
+     * 协议 v2 的认证应答：HMAC-SHA256(PIN, nonce) 的小写十六进制。
+     *
+     * PIN 本身不上蓝牙链路，旁听者拿不到；nonce 每次认证后作废，重放无效。
+     */
+    fun hmacHex(pin: String, nonce: String): String {
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(
+            javax.crypto.spec.SecretKeySpec(
+                pin.toByteArray(Charsets.UTF_8), "HmacSHA256"
+            )
+        )
+        return mac.doFinal(nonce.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+    }
     const val CMD_SHUTDOWN = "SHUTDOWN"
     const val CMD_RESTART = "RESTART"
     const val CMD_SLEEP = "SLEEP"

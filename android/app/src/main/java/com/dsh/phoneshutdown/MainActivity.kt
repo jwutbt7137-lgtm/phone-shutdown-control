@@ -18,6 +18,9 @@ import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import java.text.SimpleDateFormat
@@ -68,6 +71,9 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
     private var targetAddress: String? = null
     private var targetName: String? = null
 
+    /** 电脑端下发的认证 nonce（协议 v2）；旧版电脑端为 null */
+    private var authNonce: String? = null
+
     // ------------------------------------------------------------------ 生命周期
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -75,7 +81,18 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
         prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         ble = BleClient(this, this)
 
-        setContentView(buildUi())
+        val root = buildUi()
+        setContentView(root)
+        // targetSdk 35 在 Android 15 上强制 edge-to-edge，自己给根布局加安全区内边距，
+        // 否则状态栏/挖孔会压住标题，底部也可能被导航条盖住。
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            insets
+        }
         applyStatus("未连接", R.color.text_sub)
         setCommandsEnabled(false)
         log("准备就绪。电脑端需 Windows 10 1809 或更高版本。")
@@ -208,6 +225,7 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
 
     override fun onConnected(deviceName: String?) {
         helloHandled = false
+        authNonce = null
         pinDialog?.dismiss()
         pinDialog = null
         applyStatus("握手中…", R.color.warn_amber)
@@ -282,6 +300,9 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
         val version = parts.getOrNull(1)?.toIntOrNull() ?: 0
         val needAuth = parts.getOrNull(2)?.equals("AUTH", ignoreCase = true) ?: true
 
+        // 协议 v2：电脑端下发 nonce，手机回 HMAC，PIN 不上链路
+        authNonce = parts.getOrNull(3)?.takeIf { it.isNotBlank() }
+
         if (version != BleProtocol.PROTOCOL_VERSION) {
             log("提示：协议版本不一致（电脑端 $version，手机端 ${BleProtocol.PROTOCOL_VERSION}）")
         }
@@ -300,8 +321,11 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
         val trusted = savedAddr != null && currentAddr != null &&
             savedAddr.equals(currentAddr, ignoreCase = true)
         if (saved != null && PIN_REGEX.matches(saved) && trusted) {
-            log("用已保存的 PIN 认证（同一台电脑）")
-            enqueue("${BleProtocol.CMD_AUTH} $saved")
+            log(
+                if (authNonce != null) "用已保存的 PIN 认证（同一台电脑，HMAC）"
+                else "用已保存的 PIN 认证（旧版电脑端，明文 PIN）"
+            )
+            sendAuth(saved)
         } else {
             if (saved != null) log("换了设备，请确认设备名称和地址后再输入 PIN")
             applyStatus("需要认证", R.color.warn_amber)
@@ -357,7 +381,7 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
                 }
                 prefs.edit().putString(KEY_PIN, value).apply()
                 dialog.dismiss()
-                enqueue("${BleProtocol.CMD_AUTH} $value")
+                sendAuth(value)
             }
         }
         dialog.setOnDismissListener { if (pinDialog === dialog) pinDialog = null }
@@ -374,6 +398,16 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
         } else {
             command
         }
+
+    /** 有 nonce 就走协议 v2 的 HMAC 应答，没有就退回明文 PIN（旧版电脑端）。 */
+    private fun sendAuth(pin: String) {
+        val nonce = authNonce
+        if (nonce != null) {
+            enqueue("${BleProtocol.CMD_AUTH2} ${BleProtocol.hmacHex(pin, nonce)}")
+        } else {
+            enqueue("${BleProtocol.CMD_AUTH} $pin")
+        }
+    }
 
     private fun enqueue(command: String) {
         if (!ble.isConnected) {
@@ -434,7 +468,8 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
         otherHeader.visibility = View.GONE
         targetRow.removeAllViews()
         foundDevices.clear()
-        targetAddress = null
+        // 保留"上次连过的电脑"地址，扫描没有新结果时「连接电脑」仍然可用
+        targetAddress = prefs.getString(KEY_LAST_ADDR, null)
         autoConnectPending = true
         autoConnectInFlight = false
         connectBtn.isEnabled = false

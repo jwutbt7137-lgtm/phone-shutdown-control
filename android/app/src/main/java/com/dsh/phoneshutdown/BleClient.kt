@@ -44,6 +44,8 @@ class BleClient(private val context: Context, private val listener: Listener) {
         private const val TAG = "BleClient"
         private const val CONNECT_TIMEOUT_MS = 15_000L
         private const val READY_TIMEOUT_MS = 10_000L
+        private const val SCAN_TIMEOUT_MS = 12_000L
+        private const val AUTO_STOP_DELAY_MS = 1_500L
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -68,6 +70,8 @@ class BleClient(private val context: Context, private val listener: Listener) {
 
     private var connectTimeout: Runnable? = null
     private var readyTimeout: Runnable? = null
+    private var scanTimeout: Runnable? = null
+    private var autoStopPending = false
     private var readySignaled = false
     private val seenAddresses = HashSet<String>()
 
@@ -307,6 +311,11 @@ class BleClient(private val context: Context, private val listener: Listener) {
         try {
             s.startScan(null, settings, scanCallback)
             isScanning = true
+            autoStopPending = false
+            // 扫描不能永远开着：低延迟模式很费电，锁屏后系统还可能静默停扫
+            val r = Runnable { if (isScanning) stopScan() }
+            scanTimeout = r
+            main.postDelayed(r, SCAN_TIMEOUT_MS)
             listener.onLog("开始扫描附近设备…（电脑端程序需先运行）")
         } catch (e: SecurityException) {
             listener.onLog("扫描失败：权限被拒绝 (${e.message})")
@@ -315,13 +324,16 @@ class BleClient(private val context: Context, private val listener: Listener) {
 
     @SuppressLint("MissingPermission")
     fun stopScan() {
+        val wasScanning = isScanning
         isScanning = false
+        scanTimeout?.let { main.removeCallbacks(it) }
+        scanTimeout = null
         try {
             scanner?.stopScan(scanCallback)
         } catch (e: SecurityException) {
             Log.w(TAG, "stopScan denied", e)
         }
-        listener.onScanStopped(scanTotal, markedCount)
+        if (wasScanning) listener.onScanStopped(scanTotal, markedCount)
     }
 
     private val scanCallback = object : ScanCallback() {
@@ -349,6 +361,11 @@ class BleClient(private val context: Context, private val listener: Listener) {
                 if (markedAddresses.add(address)) {
                     markedCount++
                     listener.onScanResult(display, address, true, rssi)
+                    // 已经找到目标，再扫下去只是耗电；稍等一下让上层决定连不连
+                    if (!autoStopPending) {
+                        autoStopPending = true
+                        main.postDelayed({ if (isScanning) stopScan() }, AUTO_STOP_DELAY_MS)
+                    }
                 }
             } else if (seenAddresses.add(address)) {
                 scanTotal++
@@ -358,6 +375,8 @@ class BleClient(private val context: Context, private val listener: Listener) {
 
         override fun onScanFailed(errorCode: Int) {
             isScanning = false
+            scanTimeout?.let { main.removeCallbacks(it) }
+            scanTimeout = null
             listener.onLog("扫描失败，错误码 $errorCode")
             listener.onScanStopped(scanTotal, markedCount)
         }

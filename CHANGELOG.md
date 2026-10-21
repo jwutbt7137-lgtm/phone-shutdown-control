@@ -7,8 +7,29 @@
 
 ### 计划中
 
-- 支持自定义关机倒计时（手机端可调，当前只能改 `config.json`）
+- 手机端可调的关机倒计时
 - 多电脑管理（一台手机记住多台已认证电脑）
+
+## [1.2.0] - 2026-10-21
+
+### 新增
+
+- **协议 v2：nonce + HMAC 认证**。电脑端 `HELLO 2 AUTH <nonce>`，手机回
+  `AUTH2 HMAC-SHA256(PIN, nonce)`，PIN 不再出现在蓝牙链路上；nonce 一次一换，旧应答不能重放
+- 兼容旧版：旧 App 的明文 `AUTH <pin>` 仍可用，服务端记警告
+- 手机端扫描 12 秒自动停止；认出目标后 1.5 秒自动停扫并触发连接
+- Android 15 edge-to-edge 适配（根布局消费 system bars / 挖孔 insets）
+- 版本号终于对上：`versionName 1.2.0`（v1.1.0 的 APK 里代码没改，显示还是 1.0）
+
+### 安全
+
+- 单次写入最多处理 4 条命令，堵住"一次写入塞几十条 AUTH"绕过失败计数的路
+- `config.json` 做类型/范围校验：`"false"` 字符串、非法延时、非对象配置都有兜底
+- 手机端从"附近的其他设备"切换连接时保留上次电脑地址，「连接电脑」不会在扫描后被误禁用
+
+### 修复
+
+- 扫描停止事件不再重复触发（只有真的在扫时才回调）
 
 ## [1.1.0] - 2026-10-21
 
@@ -81,5 +102,7 @@
   - GitHub Actions：Python 逻辑测试 + Android 构建
   - MIT 许可证
 
-[Unreleased]: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jwutbt7137-lgtm/phone-shutdown-control/releases/tag/v1.0.0
