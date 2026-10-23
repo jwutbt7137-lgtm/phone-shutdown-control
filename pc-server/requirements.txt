@@ -13,6 +13,6 @@ winrt-runtime>=3.1.0
 winrt-Windows.Foundation>=3.1.0
 winrt-Windows.Foundation.Collections>=3.1.0
 winrt-Windows.Storage.Streams>=3.1.0
-winrt-Windows.Devices.Bluetooth>=3.1.0
+winrt-Windows.Devices.Bluetooth>=3.2.1
 winrt-Windows.Devices.Bluetooth.GenericAttributeProfile>=3.1.0
 winrt-Windows.Devices.Bluetooth.Advertisement>=3.1.0
